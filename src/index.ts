@@ -11,7 +11,7 @@ app.use("*", async (c, next) => {
   const corsMiddleware = cors({
     origin: allowed.includes("*") ? "*" : allowed,
     allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowHeaders: ["Content-Type"],
+    allowHeaders: ["Content-Type", "Authorization"],
   });
   return corsMiddleware(c, next);
 });
