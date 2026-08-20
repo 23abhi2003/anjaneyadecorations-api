@@ -1,0 +1,23 @@
+{
+  "name": "anjaneya-backend",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create anjaneya-db",
+    "db:migrate:local": "wrangler d1 execute anjaneya-db --local --file=./schema.sql",
+    "db:migrate:remote": "wrangler d1 execute anjaneya-db --remote --file=./schema.sql",
+    "db:seed:local": "wrangler d1 execute anjaneya-db --local --file=./seed.sql",
+    "db:seed:remote": "wrangler d1 execute anjaneya-db --remote --file=./seed.sql",
+    "tail": "wrangler tail"
+  },
+  "dependencies": {
+    "hono": "^4.6.9"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241004.0",
+    "typescript": "^5.5.2",
+    "wrangler": "^3.99.0"
+  }
+}

@@ -1,0 +1,16 @@
+name = "anjaneya-backend"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# One shared worker config. If you want separate dev/staging/prod databases,
+# duplicate the [[d1_databases]] block under [env.staging] / [env.production].
+[[d1_databases]]
+binding = "DB"
+database_name = "anjaneya-db"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+[vars]
+# Comma-separated list of origins allowed to call this API (your Pages URL).
+# Use "*" while testing, then lock it down once you know your pages.dev / custom domain.
+ALLOWED_ORIGINS = "*"
