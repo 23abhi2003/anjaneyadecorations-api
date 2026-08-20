@@ -1,4 +1,4 @@
-name = "anjaneya-backend"
+name = "anjaneyadecorations-api"
 main = "src/index.ts"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
@@ -8,7 +8,7 @@ compatibility_flags = ["nodejs_compat"]
 [[d1_databases]]
 binding = "DB"
 database_name = "anjaneya-db"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_id = "5a42f2a7-272a-4e10-8aee-1035ee242a97"
 
 [vars]
 # Comma-separated list of origins allowed to call this API (your Pages URL).
