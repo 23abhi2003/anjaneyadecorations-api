@@ -105,3 +105,60 @@ export async function updateStaffAssignments(db: D1Database, id: string, assignm
   const merged: StaffMember = { ...existing, assignments };
   await db.prepare(`UPDATE staff SET data = ? WHERE id = ?`).bind(JSON.stringify(merged), id).run();
 }
+
+/**
+ * Keeps every staff member's `assignments` array in sync with a single order.
+ *
+ * For every staff member: drops any existing assignment record for this order,
+ * then — if that staff member is currently assigned on the order — re-adds a
+ * fresh record with the order's latest program/customer/amount/date.
+ *
+ * Call this after both creating AND updating an order, so re-assigning staff,
+ * changing someone's amount, or removing a staff member from an order is
+ * immediately reflected on the Staff page — not just at order-creation time.
+ */
+export async function syncStaffAssignmentsForOrder(db: D1Database, order: Order): Promise<void> {
+  const allStaff = await listStaff(db);
+  const assignedByStaffId = new Map((order.staffAssigned ?? []).map((a) => [a.staffId, a]));
+  const customerName = (order.customer as { name?: string } | undefined)?.name ?? "";
+  const program = order.program?.type || order.serviceType || "";
+  const date = order.eventDate || order.createdAt;
+
+  for (const staff of allStaff) {
+    const existingAssignments = staff.assignments ?? [];
+    const withoutThisOrder = existingAssignments.filter((a) => a.orderId !== order.id);
+    const hadThisOrder = withoutThisOrder.length !== existingAssignments.length;
+    const currentAssignment = assignedByStaffId.get(staff.id);
+
+    // Nothing to change for this staff member: they weren't on this order before
+    // and aren't on it now.
+    if (!hadThisOrder && !currentAssignment) continue;
+
+    const nextAssignments = currentAssignment
+      ? [
+          ...withoutThisOrder,
+          {
+            orderId: order.id,
+            program,
+            customerName,
+            amount: currentAssignment.amount || "",
+            date,
+          },
+        ]
+      : withoutThisOrder;
+
+    await updateStaffAssignments(db, staff.id, nextAssignments);
+  }
+}
+
+/** Strips any assignment records referencing a deleted order, from every staff member. */
+export async function removeOrderFromAllStaffAssignments(db: D1Database, orderId: string): Promise<void> {
+  const allStaff = await listStaff(db);
+  for (const staff of allStaff) {
+    const existing = staff.assignments ?? [];
+    const filtered = existing.filter((a) => a.orderId !== orderId);
+    if (filtered.length !== existing.length) {
+      await updateStaffAssignments(db, staff.id, filtered);
+    }
+  }
+}

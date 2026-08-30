@@ -57,23 +57,7 @@ app.post("/api/orders", async (c) => {
   } as Order;
 
   await db.insertOrder(c.env.DB, order, seq);
-
-  const staffAssigned = order.staffAssigned ?? [];
-  if (staffAssigned.length) {
-    for (const a of staffAssigned) {
-      const match = await db.getStaff(c.env.DB, a.staffId);
-      if (!match) continue;
-      const record = {
-        orderId: order.id,
-        program: order.program?.type || order.serviceType || "",
-        customerName: (order.customer as { name?: string })?.name ?? "",
-        amount: a.amount || "",
-        date: order.eventDate || order.createdAt,
-      };
-      const assignments = [...(match.assignments || []), record];
-      await db.updateStaffAssignments(c.env.DB, match.id, assignments);
-    }
-  }
+  await db.syncStaffAssignmentsForOrder(c.env.DB, order);
 
   return c.json(order, 201);
 });
@@ -88,12 +72,15 @@ app.put("/api/orders/:id", async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as Partial<Order>;
   const order = await db.updateOrder(c.env.DB, c.req.param("id"), body);
   if (!order) return c.json({ error: "Not found." }, 404);
+  await db.syncStaffAssignmentsForOrder(c.env.DB, order);
   return c.json(order);
 });
 
 app.delete("/api/orders/:id", async (c) => {
-  const ok = await db.deleteOrder(c.env.DB, c.req.param("id"));
+  const id = c.req.param("id");
+  const ok = await db.deleteOrder(c.env.DB, id);
   if (!ok) return c.json({ error: "Not found." }, 404);
+  await db.removeOrderFromAllStaffAssignments(c.env.DB, id);
   return c.json({ success: true });
 });
 
