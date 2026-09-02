@@ -33,7 +33,9 @@ CREATE TABLE IF NOT EXISTS staff (
   id          TEXT PRIMARY KEY,
   name        TEXT NOT NULL,
   phone       TEXT NOT NULL DEFAULT '',
+  pin         TEXT NOT NULL DEFAULT '', -- 4-digit staff login PIN
   data        TEXT NOT NULL, -- full StaffMember JSON (incl. assignments[])
   inserted_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 CREATE INDEX IF NOT EXISTS idx_staff_name ON staff(name);
+CREATE INDEX IF NOT EXISTS idx_staff_phone ON staff(phone);

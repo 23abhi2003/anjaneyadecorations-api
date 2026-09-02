@@ -7,14 +7,21 @@ export interface HasId {
   [key: string]: unknown;
 }
 
+export type CompletionStatus = "pending" | "completed";
+
 export type Order = HasId & {
   customer?: { name?: string; phone?: string; [k: string]: unknown };
   eventDate?: string | null;
   status?: "pending" | "confirmed" | "completed";
+  /** Has the physical order (tent/decoration work) been completed? */
+  orderCompletionStatus?: CompletionStatus;
+  /** Has the invoice been paid in full? Owner-managed. */
+  paymentCompletionStatus?: CompletionStatus;
   createdAt?: string;
   staffAssigned?: Array<{ staffId: string; name: string; amount: string }>;
   program?: { type?: string; name?: string; imageUrl?: string };
   serviceType?: string;
+  invoice?: { totalAmount?: string; advancePaid?: string; dueAmount?: string; paymentType?: string };
 };
 
 export type Customer = HasId & {
@@ -26,6 +33,8 @@ export type Customer = HasId & {
 export type StaffMember = HasId & {
   name?: string;
   phone?: string;
+  /** 4-digit login PIN. Never echoed back in list/get responses. */
+  pin?: string;
   assignments?: Array<{
     orderId: string;
     program: string;
@@ -38,4 +47,9 @@ export type StaffMember = HasId & {
 export type Bindings = {
   DB: D1Database;
   ALLOWED_ORIGINS?: string;
+  /** Secret used to sign auth tokens. Set a real value via `wrangler secret put AUTH_SECRET` in production. */
+  AUTH_SECRET?: string;
+  /** Hardcoded owner login credentials (phone + 4-digit PIN). */
+  OWNER_PHONE?: string;
+  OWNER_PIN?: string;
 };

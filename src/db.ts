@@ -1,4 +1,5 @@
 import type { Customer, Order, StaffMember } from "./types";
+import { uniqueSlug } from "./ids";
 
 // ---------- orders ----------
 
@@ -56,6 +57,19 @@ export async function deleteOrder(db: D1Database, id: string): Promise<boolean> 
   return (res.meta.changes ?? 0) > 0;
 }
 
+/** Orders belonging to a given customer, matched by phone (preferred) or exact name. */
+export async function listOrdersForCustomer(db: D1Database, customer: Customer): Promise<Order[]> {
+  const all = await listOrders(db);
+  const phone = (customer.phone || "").trim();
+  const name = (customer.name || "").trim().toLowerCase();
+  return all.filter((o) => {
+    const oc = (o.customer ?? {}) as { name?: string; phone?: string };
+    if (phone && oc.phone && oc.phone.trim() === phone) return true;
+    if (!phone && oc.name && oc.name.trim().toLowerCase() === name) return true;
+    return false;
+  });
+}
+
 // ---------- customers ----------
 
 export async function listCustomers(db: D1Database): Promise<Customer[]> {
@@ -68,11 +82,58 @@ export async function listCustomerIds(db: D1Database): Promise<string[]> {
   return results.map((r) => r.id);
 }
 
+export async function getCustomer(db: D1Database, id: string): Promise<Customer | null> {
+  const row = await db.prepare("SELECT data FROM customers WHERE id = ?").bind(id).first<{ data: string }>();
+  return row ? (JSON.parse(row.data) as Customer) : null;
+}
+
 export async function insertCustomer(db: D1Database, customer: Customer): Promise<void> {
   await db
     .prepare(`INSERT INTO customers (id, name, phone, data) VALUES (?, ?, ?, ?)`)
     .bind(customer.id, customer.name ?? "", customer.phone ?? "", JSON.stringify(customer))
     .run();
+}
+
+/**
+ * Called after every order create/update. Looks for an existing customer by
+ * phone (preferred) or exact name; if none exists, auto-creates one from the
+ * order's customer info. Keeps the Customers page in sync with orders
+ * without staff having to double-enter anyone.
+ */
+export async function ensureCustomerFromOrder(
+  db: D1Database,
+  orderCustomer: { name?: string; phone?: string; type?: string; address?: string; location?: unknown } | undefined
+): Promise<void> {
+  const name = (orderCustomer?.name || "").trim();
+  if (!name) return;
+  const phone = (orderCustomer?.phone || "").trim();
+
+  const all = await listCustomers(db);
+  const existing = all.find((c) => {
+    if (phone && c.phone && c.phone.trim() === phone) return true;
+    if (!phone && c.name && c.name.trim().toLowerCase() === name.toLowerCase()) return true;
+    return false;
+  });
+  if (existing) {
+    // Backfill a phone number onto an older record that didn't have one yet.
+    if (phone && !existing.phone) {
+      const merged: Customer = { ...existing, phone };
+      await db.prepare(`UPDATE customers SET phone = ?, data = ? WHERE id = ?`).bind(phone, JSON.stringify(merged), existing.id).run();
+    }
+    return;
+  }
+
+  const existingIds = all.map((c) => c.id);
+  const id = uniqueSlug(name, existingIds);
+  const customer: Customer = {
+    id,
+    name,
+    phone,
+    type: (orderCustomer?.type as Customer["type"]) || "new",
+    address: orderCustomer?.address as string | undefined,
+    location: (orderCustomer?.location ?? null) as Customer["location"],
+  } as Customer;
+  await insertCustomer(db, customer);
 }
 
 // ---------- staff ----------
@@ -92,11 +153,38 @@ export async function getStaff(db: D1Database, id: string): Promise<StaffMember 
   return row ? (JSON.parse(row.data) as StaffMember) : null;
 }
 
+/** Looks up a staff member by phone number, for staff login. */
+export async function getStaffByPhone(db: D1Database, phone: string): Promise<StaffMember | null> {
+  const normalized = (phone || "").trim();
+  if (!normalized) return null;
+  const row = await db
+    .prepare("SELECT data FROM staff WHERE phone = ? LIMIT 1")
+    .bind(normalized)
+    .first<{ data: string }>();
+  return row ? (JSON.parse(row.data) as StaffMember) : null;
+}
+
 export async function insertStaff(db: D1Database, staff: StaffMember): Promise<void> {
   await db
-    .prepare(`INSERT INTO staff (id, name, phone, data) VALUES (?, ?, ?, ?)`)
-    .bind(staff.id, staff.name ?? "", staff.phone ?? "", JSON.stringify(staff))
+    .prepare(`INSERT INTO staff (id, name, phone, pin, data) VALUES (?, ?, ?, ?, ?)`)
+    .bind(staff.id, staff.name ?? "", staff.phone ?? "", staff.pin ?? "", JSON.stringify(staff))
     .run();
+}
+
+/** Updates a staff member's own profile fields (name/phone/pin) — not their assignments. */
+export async function updateStaffProfile(
+  db: D1Database,
+  id: string,
+  patch: { name?: string; phone?: string; pin?: string }
+): Promise<StaffMember | null> {
+  const existing = await getStaff(db, id);
+  if (!existing) return null;
+  const merged: StaffMember = { ...existing, ...patch };
+  await db
+    .prepare(`UPDATE staff SET name = ?, phone = ?, pin = ?, data = ? WHERE id = ?`)
+    .bind(merged.name ?? "", merged.phone ?? "", merged.pin ?? "", JSON.stringify(merged), id)
+    .run();
+  return merged;
 }
 
 export async function updateStaffAssignments(db: D1Database, id: string, assignments: StaffMember["assignments"]): Promise<void> {
