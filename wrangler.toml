@@ -14,3 +14,15 @@ database_id = "5a42f2a7-272a-4e10-8aee-1035ee242a97"
 # Comma-separated list of origins allowed to call this API (your Pages URL).
 # Use "*" while testing, then lock it down once you know your pages.dev / custom domain.
 ALLOWED_ORIGINS = "*"
+
+# Owner login credentials (phone number + 4-digit PIN). Change these here,
+# or better: remove them from this file and set them as secrets instead —
+# `wrangler secret put OWNER_PHONE` / `wrangler secret put OWNER_PIN` —
+# so they aren't committed to source control.
+OWNER_PHONE = "7416411182"
+OWNER_PIN = "1182"
+
+# Secret used to sign login tokens. This default is fine for local dev, but
+# for production run: `wrangler secret put AUTH_SECRET` (any long random
+# string) so tokens can't be forged by anyone who reads this file.
+AUTH_SECRET = "anjaneya-dev-secret-change-me"

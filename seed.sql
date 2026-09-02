@@ -9,10 +9,10 @@ INSERT INTO customers (id, name, phone, data) VALUES ('laxman', 'Laxman', '', '{
 INSERT INTO customers (id, name, phone, data) VALUES ('bongurapu-satish', 'Bongurapu Satish (mama)', '', '{"id": "bongurapu-satish", "name": "Bongurapu Satish (mama)", "phone": "", "type": "older"}');
 INSERT INTO customers (id, name, phone, data) VALUES ('ch-karunakar', 'Ch. Karunakar', '', '{"id": "ch-karunakar", "name": "Ch. Karunakar", "phone": "", "type": "older"}');
 INSERT INTO customers (id, name, phone, data) VALUES ('pulla-srinivas', 'Pulla Srinivas', '', '{"id": "pulla-srinivas", "name": "Pulla Srinivas", "phone": "", "type": "older"}');
-INSERT INTO staff (id, name, phone, data) VALUES ('shivaji', 'Shivaji', '', '{"id": "shivaji", "name": "Shivaji", "phone": "", "assignments": []}');
-INSERT INTO staff (id, name, phone, data) VALUES ('ashwin', 'Ashwin', '', '{"id": "ashwin", "name": "Ashwin", "phone": "", "assignments": []}');
-INSERT INTO staff (id, name, phone, data) VALUES ('kitty', 'Kitty', '', '{"id": "kitty", "name": "Kitty", "phone": "", "assignments": []}');
-INSERT INTO staff (id, name, phone, data) VALUES ('bhagya', 'Bhagya', '', '{"id": "bhagya", "name": "Bhagya", "phone": "", "assignments": []}');
-INSERT INTO staff (id, name, phone, data) VALUES ('sathwika', 'Sathwika', '', '{"id": "sathwika", "name": "Sathwika", "phone": "", "assignments": []}');
-INSERT INTO staff (id, name, phone, data) VALUES ('abhiram', 'Abhiram', '', '{"id": "abhiram", "name": "Abhiram", "phone": "", "assignments": []}');
-INSERT INTO staff (id, name, phone, data) VALUES ('vinay', 'Vinay', '', '{"id": "vinay", "name": "Vinay", "phone": "", "assignments": []}');
+INSERT INTO staff (id, name, phone, pin, data) VALUES ('shivaji', 'Shivaji', '', '1001', '{"id": "shivaji", "name": "Shivaji", "phone": "", "assignments": []}');
+INSERT INTO staff (id, name, phone, pin, data) VALUES ('ashwin', 'Ashwin', '', '1002', '{"id": "ashwin", "name": "Ashwin", "phone": "", "assignments": []}');
+INSERT INTO staff (id, name, phone, pin, data) VALUES ('kitty', 'Kitty', '', '1003', '{"id": "kitty", "name": "Kitty", "phone": "", "assignments": []}');
+INSERT INTO staff (id, name, phone, pin, data) VALUES ('bhagya', 'Bhagya', '', '1004', '{"id": "bhagya", "name": "Bhagya", "phone": "", "assignments": []}');
+INSERT INTO staff (id, name, phone, pin, data) VALUES ('sathwika', 'Sathwika', '', '1005', '{"id": "sathwika", "name": "Sathwika", "phone": "", "assignments": []}');
+INSERT INTO staff (id, name, phone, pin, data) VALUES ('abhiram', 'Abhiram', '', '1006', '{"id": "abhiram", "name": "Abhiram", "phone": "", "assignments": []}');
+INSERT INTO staff (id, name, phone, pin, data) VALUES ('vinay', 'Vinay', '', '1007', '{"id": "vinay", "name": "Vinay", "phone": "", "assignments": []}');
