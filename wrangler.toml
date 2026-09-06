@@ -15,14 +15,20 @@ database_id = "5a42f2a7-272a-4e10-8aee-1035ee242a97"
 # Use "*" while testing, then lock it down once you know your pages.dev / custom domain.
 ALLOWED_ORIGINS = "*"
 
-# Owner login credentials (phone number + 4-digit PIN). Change these here,
-# or better: remove them from this file and set them as secrets instead —
-# `wrangler secret put OWNER_PHONE` / `wrangler secret put OWNER_PIN` —
-# so they aren't committed to source control.
-OWNER_PHONE = "7416411182"
-OWNER_PIN = "1182"
-
-# Secret used to sign login tokens. This default is fine for local dev, but
-# for production run: `wrangler secret put AUTH_SECRET` (any long random
-# string) so tokens can't be forged by anyone who reads this file.
-AUTH_SECRET = "anjaneya-dev-secret-change-me"
+# --------------------------------------------------------------------------
+# OWNER_PHONE, OWNER_PIN, and AUTH_SECRET are intentionally NOT set here.
+#
+# They must be set as Cloudflare *secrets* instead of plain vars, so they're
+# encrypted and never shown/committed as plain text:
+#
+#   npx wrangler secret put OWNER_PHONE
+#   npx wrangler secret put OWNER_PIN
+#   npx wrangler secret put AUTH_SECRET      # use: openssl rand -hex 32
+#
+# Run each command, paste the value when prompted, then redeploy:
+#
+#   npx wrangler deploy
+#
+# If any of these three still appear under [vars] here, wrangler deploy will
+# overwrite your secrets back to plain text — keep this block var-free.
+# --------------------------------------------------------------------------
