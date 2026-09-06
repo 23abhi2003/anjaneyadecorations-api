@@ -47,9 +47,7 @@ export type StaffMember = HasId & {
 export type Bindings = {
   DB: D1Database;
   ALLOWED_ORIGINS?: string;
-  /** Secret used to sign auth tokens. Set a real value via `wrangler secret put AUTH_SECRET` in production. */
-  AUTH_SECRET?: string;
-  /** Hardcoded owner login credentials (phone + 4-digit PIN). */
+  /** Owner login credentials (phone + 4-digit PIN). Set via `wrangler secret put` in production. */
   OWNER_PHONE?: string;
   OWNER_PIN?: string;
 };

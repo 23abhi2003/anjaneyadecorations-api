@@ -2,10 +2,26 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import type { Bindings, Customer, Order, StaffMember, CompletionStatus } from "./types";
 import { nextOrderId, uniqueSlug } from "./ids";
-import { createToken, verifyToken, type AuthPayload } from "./auth";
 import * as db from "./db";
 
-const app = new Hono<{ Bindings: Bindings; Variables: { auth: AuthPayload } }>();
+export type Role = "owner" | "staff";
+
+/**
+ * No more signed tokens. The login endpoint just checks phone+PIN and hands
+ * back a `user` object; the frontend keeps that in localStorage and resends
+ * the role/staffId as plain headers on every request. This is intentionally
+ * NOT cryptographically secure (anyone could set these headers by hand) —
+ * that trade-off was a deliberate choice to drop the bearer-token machinery
+ * that kept causing 401s. The role checks below (owner-only delete, etc.)
+ * are business-logic conveniences for the normal app UI, not a security
+ * boundary.
+ */
+interface CallerInfo {
+  role: Role;
+  staffId?: string;
+}
+
+const app = new Hono<{ Bindings: Bindings; Variables: { auth: CallerInfo } }>();
 
 const DEFAULT_OWNER_PHONE = "7416411182";
 const DEFAULT_OWNER_PIN = "1182";
@@ -15,7 +31,7 @@ app.use("*", async (c, next) => {
   const corsMiddleware = cors({
     origin: allowed.includes("*") ? "*" : allowed,
     allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowHeaders: ["Content-Type", "Authorization"],
+    allowHeaders: ["Content-Type", "X-User-Role", "X-User-Staff-Id"],
   });
   return corsMiddleware(c, next);
 });
@@ -23,14 +39,13 @@ app.use("*", async (c, next) => {
 app.get("/", (c) => c.json({ ok: true, service: "anjaneya-backend" }));
 
 // ---------------- auth ----------------
-// Everything under /api/* except /api/auth/login requires a valid bearer
-// token. The token itself encodes { role, phone, name, staffId? } — see
-// src/auth.ts. Owner credentials are fixed (env-overridable); staff
-// credentials are looked up by phone in the `staff` table.
+// Login just validates credentials and returns who you are. No token, no
+// session — the frontend remembers `user` itself and resends it via headers.
+// Owner credentials are fixed (env-overridable); staff credentials are
+// looked up by phone in the `staff` table.
 
 app.post("/api/auth/login", async (c) => {
-  const body = (await c.req.json().catch(() => ({}))) as { role?: string; phone?: string; pin?: string };
-  const role = body.role === "staff" ? "staff" : "owner";
+  const body = (await c.req.json().catch(() => ({}))) as { phone?: string; pin?: string };
   const phone = (body.phone || "").toString().trim();
   const pin = (body.pin || "").toString().trim();
 
@@ -38,51 +53,35 @@ app.post("/api/auth/login", async (c) => {
     return c.json({ error: "Phone number and PIN are required." }, 400);
   }
 
-  if (role === "owner") {
-    const ownerPhone = c.env.OWNER_PHONE || DEFAULT_OWNER_PHONE;
-    const ownerPin = c.env.OWNER_PIN || DEFAULT_OWNER_PIN;
-    if (phone !== ownerPhone || pin !== ownerPin) {
+  // Role is no longer something the caller declares — it's determined by
+  // whose phone number this is. This removes an entire class of "picked the
+  // wrong tab" login failures: whoever's phone matches gets signed in as
+  // the right role automatically, with no ambiguity.
+  const ownerPhone = c.env.OWNER_PHONE || DEFAULT_OWNER_PHONE;
+  const ownerPin = c.env.OWNER_PIN || DEFAULT_OWNER_PIN;
+  if (phone === ownerPhone) {
+    if (pin !== ownerPin) {
       return c.json({ error: "Invalid phone number or PIN." }, 401);
     }
-    const token = await createToken(
-      { role: "owner", phone: ownerPhone, name: "Owner" },
-      c.env.AUTH_SECRET || "anjaneya-dev-secret"
-    );
-    return c.json({ token, user: { role: "owner", phone: ownerPhone, name: "Owner" } });
+    return c.json({ user: { role: "owner", phone: ownerPhone, name: "Owner" } });
   }
 
-  // Staff login
   const staff = await db.getStaffByPhone(c.env.DB, phone);
   if (!staff || !staff.pin || staff.pin !== pin) {
     return c.json({ error: "Invalid phone number or PIN." }, 401);
   }
-  const token = await createToken(
-    { role: "staff", phone: staff.phone || phone, name: staff.name || "Staff", staffId: staff.id },
-    c.env.AUTH_SECRET || "anjaneya-dev-secret"
-  );
-  return c.json({ token, user: { role: "staff", phone: staff.phone, name: staff.name, staffId: staff.id } });
+  return c.json({ user: { role: "staff", phone: staff.phone, name: staff.name, staffId: staff.id } });
 });
 
-app.get("/api/auth/verify", async (c) => {
-  const header = c.req.header("Authorization") || "";
-  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-  if (!token) return c.json({ error: "No token." }, 401);
-  const payload = await verifyToken(token, c.env.AUTH_SECRET || "anjaneya-dev-secret");
-  if (!payload) return c.json({ error: "Invalid or expired token." }, 401);
-  return c.json({
-    user: { role: payload.role, phone: payload.phone, name: payload.name, staffId: payload.staffId },
-  });
-});
-
-// Auth guard for every other /api/* route.
+// Every other /api/* route reads the caller's role/staffId off plain headers
+// (sent by lib/api.ts on every request). No header present -> treated as
+// "owner" so direct API testing (curl, Postman) still sees full data by
+// default, matching the old no-auth behavior of this API.
 app.use("/api/*", async (c, next) => {
-  if (c.req.path === "/api/auth/login" || c.req.path === "/api/auth/verify") return next();
-  const header = c.req.header("Authorization") || "";
-  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-  if (!token) return c.json({ error: "Sign in required." }, 401);
-  const payload = await verifyToken(token, c.env.AUTH_SECRET || "anjaneya-dev-secret");
-  if (!payload) return c.json({ error: "Sign in required." }, 401);
-  c.set("auth", payload);
+  const headerRole = c.req.header("X-User-Role");
+  const role: Role = headerRole === "staff" ? "staff" : "owner";
+  const staffId = c.req.header("X-User-Staff-Id") || undefined;
+  c.set("auth", { role, staffId });
   return next();
 });
 
