@@ -23,8 +23,8 @@ interface CallerInfo {
 
 const app = new Hono<{ Bindings: Bindings; Variables: { auth: CallerInfo } }>();
 
-const DEFAULT_OWNER_PHONE = "7416411182";
-const DEFAULT_OWNER_PIN = "1182";
+const DEFAULT_OWNER_PHONE = "9704452180";
+const DEFAULT_OWNER_PIN = "1982";
 
 app.use("*", async (c, next) => {
   const allowed = (c.env.ALLOWED_ORIGINS ?? "*").split(",").map((s) => s.trim());
