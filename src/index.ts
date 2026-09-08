@@ -269,6 +269,62 @@ app.post("/api/staff", async (c) => {
   return c.json(rest, 201);
 });
 
+// Owner-only: fix up a single assignment row shown on the Staff page (the
+// amount owed to that staff member for one order, or the order/customer/date
+// details attached to it). Assignments are a *derived* view of the order's
+// `staffAssigned` list, so this writes back through to the order itself and
+// then re-runs the same sync used on order create/update — that way the
+// correction sticks instead of being silently overwritten next time the
+// order is saved.
+app.put("/api/staff/:staffId/assignments/:orderId", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") {
+    return c.json({ error: "Only the owner can edit assignment details." }, 403);
+  }
+
+  const staffId = c.req.param("staffId");
+  const orderId = c.req.param("orderId");
+  const body = (await c.req.json().catch(() => ({}))) as {
+    amount?: string;
+    date?: string;
+    program?: string;
+    customerName?: string;
+  };
+
+  const order = await db.getOrder(c.env.DB, orderId);
+  if (!order) return c.json({ error: "Order not found." }, 404);
+
+  const staffAssigned = [...(order.staffAssigned ?? [])];
+  const idx = staffAssigned.findIndex((a) => a.staffId === staffId);
+  if (idx === -1) {
+    return c.json({ error: "This staff member is not assigned to that order." }, 404);
+  }
+
+  if (typeof body.amount === "string") {
+    staffAssigned[idx] = { ...staffAssigned[idx], amount: body.amount.trim() };
+  }
+
+  const patch: Partial<Order> = { staffAssigned };
+  if (typeof body.date === "string" && body.date.trim()) {
+    patch.eventDate = body.date.trim();
+  }
+  if (typeof body.customerName === "string" && body.customerName.trim()) {
+    patch.customer = { ...(order.customer ?? {}), name: body.customerName.trim() };
+  }
+  if (typeof body.program === "string" && body.program.trim()) {
+    patch.program = { ...(order.program ?? {}), type: body.program.trim() };
+  }
+
+  const updated = await db.updateOrder(c.env.DB, orderId, patch);
+  if (!updated) return c.json({ error: "Not found." }, 404);
+  await db.syncStaffAssignmentsForOrder(c.env.DB, updated);
+
+  const staff = await db.getStaff(c.env.DB, staffId);
+  if (!staff) return c.json({ error: "Staff not found." }, 404);
+  const { pin: _pin, ...rest } = staff;
+  return c.json(rest);
+});
+
 app.put("/api/staff/:id", async (c) => {
   const auth = c.get("auth");
   const id = c.req.param("id");
