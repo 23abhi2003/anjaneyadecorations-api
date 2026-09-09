@@ -112,6 +112,7 @@ app.get("/api/orders", async (c) => {
 });
 
 app.post("/api/orders", async (c) => {
+  const auth = c.get("auth");
   const body = (await c.req.json().catch(() => ({}))) as Partial<Order>;
 
   if (!body.customer?.name?.toString().trim()) {
@@ -142,7 +143,13 @@ app.post("/api/orders", async (c) => {
     createdAt: new Date().toISOString().slice(0, 10),
     tenthouse: body.tenthouse ?? null,
     decoration: body.decoration ?? null,
-    staffAssigned: body.staffAssigned ?? [],
+    // Staff can assign people to a job but can never set/charge an amount for
+    // them — that's owner-only, enforced server-side (not just hidden in the
+    // UI) so a direct API call can't sneak an amount in either.
+    staffAssigned: (body.staffAssigned ?? []).map((a) => ({
+      ...a,
+      amount: auth.role === "staff" ? "" : a.amount,
+    })),
     invoice: body.invoice ?? { totalAmount: "", advancePaid: "", paymentType: "" },
     notes: body.notes ?? "",
   } as Order;
@@ -167,15 +174,19 @@ app.put("/api/orders/:id", async (c) => {
   const auth = c.get("auth");
   const body = (await c.req.json().catch(() => ({}))) as Partial<Order>;
 
+  const existing = await db.getOrder(c.env.DB, c.req.param("id"));
+  if (!existing) return c.json({ error: "Not found." }, 404);
+
   // Staff cannot see or change invoice/amount data, or the payment-completion
-  // flag — enforced here as well as in the UI.
+  // flag — enforced here as well as in the UI. Staff also cannot change who's
+  // assigned to an order once it exists (add, remove, or re-charge) — only
+  // the owner can edit staffAssigned on an update; whatever a staff caller
+  // sends for it is dropped and the existing list is kept as-is.
   if (auth.role === "staff") {
     delete (body as Partial<Order>).invoice;
     delete (body as Partial<Order>).paymentCompletionStatus;
+    delete (body as Partial<Order>).staffAssigned;
   }
-
-  const existing = await db.getOrder(c.env.DB, c.req.param("id"));
-  if (!existing) return c.json({ error: "Not found." }, 404);
 
   const merged: Order = { ...existing, ...body, id: existing.id };
   merged.status = computeOverallStatus(merged);
