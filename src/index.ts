@@ -235,6 +235,58 @@ app.post("/api/customers", async (c) => {
   return c.json(customer, 201);
 });
 
+/**
+ * Owner-only: delete a customer.
+ *
+ * Steps the endpoint enforces (the UI mirrors them):
+ *  1. Staff callers are rejected outright (403).
+ *  2. Unknown id -> 404.
+ *  3. If the customer still has orders and the caller did NOT pass
+ *     `?withOrders=true`, nothing is deleted — 409 comes back with the order
+ *     count so the UI can ask "also delete their N orders?".
+ *  4. With `?withOrders=true`, every order of theirs is deleted first and
+ *     stripped from staff assignments, then the customer row goes.
+ *
+ * Step 3 matters because orders auto-create customers
+ * (`ensureCustomerFromOrder`), so deleting a customer while leaving their
+ * orders would just bring them back on the next order save.
+ */
+app.delete("/api/customers/:id", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") {
+    return c.json({ error: "Only the owner can delete customers." }, 403);
+  }
+
+  const id = c.req.param("id");
+  const customer = await db.getCustomer(c.env.DB, id);
+  if (!customer) return c.json({ error: "Not found." }, 404);
+
+  const withOrdersParam = (c.req.query("withOrders") || "").toLowerCase();
+  const withOrders = withOrdersParam === "true" || withOrdersParam === "1" || withOrdersParam === "yes";
+
+  const orders = await db.listOrdersForCustomer(c.env.DB, customer);
+  if (orders.length > 0 && !withOrders) {
+    return c.json(
+      {
+        error: `This customer has ${orders.length} order${orders.length === 1 ? "" : "s"}. Delete the orders too, or keep the customer.`,
+        orderCount: orders.length,
+        requiresWithOrders: true,
+      },
+      409
+    );
+  }
+
+  let deletedOrders = 0;
+  if (withOrders && orders.length > 0) {
+    deletedOrders = await db.deleteOrdersForCustomer(c.env.DB, customer);
+  }
+
+  const ok = await db.deleteCustomer(c.env.DB, id);
+  if (!ok) return c.json({ error: "Not found." }, 404);
+
+  return c.json({ success: true, deletedOrders });
+});
+
 app.get("/api/customers/:id/orders", async (c) => {
   const auth = c.get("auth");
   const customer = await db.getCustomer(c.env.DB, c.req.param("id"));

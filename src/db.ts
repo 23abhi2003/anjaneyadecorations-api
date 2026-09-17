@@ -136,6 +136,31 @@ export async function ensureCustomerFromOrder(
   await insertCustomer(db, customer);
 }
 
+/** Hard-deletes a single customer row. Returns false if nothing matched. */
+export async function deleteCustomer(db: D1Database, id: string): Promise<boolean> {
+  const res = await db.prepare("DELETE FROM customers WHERE id = ?").bind(id).run();
+  return (res.meta.changes ?? 0) > 0;
+}
+
+/**
+ * Deletes every order belonging to a customer, and scrubs those orders out of
+ * every staff member's `assignments` list. Returns how many orders went.
+ *
+ * This exists because `ensureCustomerFromOrder()` runs on every order
+ * create/update: if you delete a customer but leave their orders behind, the
+ * very next time one of those orders is saved the customer is silently
+ * re-created. So a customer with orders can only be removed together with
+ * them — that's what keeps the two pages consistent.
+ */
+export async function deleteOrdersForCustomer(db: D1Database, customer: Customer): Promise<number> {
+  const orders = await listOrdersForCustomer(db, customer);
+  for (const order of orders) {
+    await deleteOrder(db, order.id);
+    await removeOrderFromAllStaffAssignments(db, order.id);
+  }
+  return orders.length;
+}
+
 // ---------- staff ----------
 
 export async function listStaff(db: D1Database): Promise<StaffMember[]> {

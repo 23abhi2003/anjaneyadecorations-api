@@ -50,4 +50,4 @@ export type Bindings = {
   /** Owner login credentials (phone + 4-digit PIN). Set via `wrangler secret put` in production. */
   OWNER_PHONE?: string;
   OWNER_PIN?: string;
-};
+};  
