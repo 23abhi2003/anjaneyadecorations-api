@@ -115,9 +115,11 @@ app.post("/api/orders", async (c) => {
   const auth = c.get("auth");
   const body = (await c.req.json().catch(() => ({}))) as Partial<Order>;
 
-  if (!body.customer?.name?.toString().trim()) {
-    return c.json({ error: "Customer name is required." }, 400);
-  }
+  // Previously rejected with 400 if customer.name was missing. Now the order
+  // still saves — customer name (and every other section) is optional at
+  // save time and can be filled in later via PUT. `ensureCustomerFromOrder`
+  // already no-ops on an empty name, so this doesn't create a blank customer.
+  const customerBody = body.customer ?? {};
 
   const maxSeq = await db.maxOrderSeq(c.env.DB);
   const { id, seq } = nextOrderId(maxSeq);
@@ -128,11 +130,11 @@ app.post("/api/orders", async (c) => {
   const order: Order = {
     id,
     customer: {
-      name: body.customer.name,
-      phone: body.customer.phone ?? "",
-      type: body.customer.type ?? "new",
-      address: body.customer.address ?? "",
-      location: body.customer.location ?? null,
+      name: customerBody.name ?? "",
+      phone: customerBody.phone ?? "",
+      type: customerBody.type ?? "new",
+      address: customerBody.address ?? "",
+      location: customerBody.location ?? null,
     },
     serviceType: body.serviceType ?? "tenthouse",
     program: body.program ?? { type: "", name: "", imageUrl: "" },
@@ -158,6 +160,7 @@ app.post("/api/orders", async (c) => {
   await db.insertOrder(c.env.DB, order, seq);
   await db.syncStaffAssignmentsForOrder(c.env.DB, order);
   // Requirement: when an order is placed, auto-add the name/phone to Customers too.
+  // Safe to call even with an empty name — it just no-ops in that case.
   await db.ensureCustomerFromOrder(c.env.DB, order.customer);
 
   return c.json(order, 201);
