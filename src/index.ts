@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import type { Bindings, Customer, Order, StaffMember, CompletionStatus, StaffPayment } from "./types";
+import type { Bindings, Customer, Order, OrderPayment, StaffMember, CompletionStatus, StaffPayment } from "./types";
 import { nextOrderId, uniqueSlug } from "./ids";
 import {
   cleanDate,
@@ -13,6 +13,7 @@ import {
   toAmount,
   withServerOwnedPayFields,
 } from "./staffPay";
+import { EPS, buildInvoice, dueOf } from "./orderPay";
 import * as db from "./db";
 
 export type Role = "owner" | "staff";
@@ -100,7 +101,10 @@ app.use("/api/*", async (c, next) => {
 function redactInvoiceForStaff(order: Order): Order {
   const { invoice, ...rest } = order;
   void invoice;
-  return { ...rest, invoice: { totalAmount: "", advancePaid: "", dueAmount: "", paymentType: "" } } as Order;
+  return {
+    ...rest,
+    invoice: { totalAmount: "", advancePaid: "", advanceDate: "", dueAmount: "", paymentType: "", payments: [] },
+  } as Order;
 }
 
 /** Recomputes the overall order status from the two completion flags, when present. */
@@ -168,7 +172,9 @@ app.post("/api/orders", async (c) => {
       })),
       undefined
     ),
-    invoice: body.invoice ?? { totalAmount: "", advancePaid: "", paymentType: "" },
+    // Payments after the advance are server-owned: a new order always starts with an empty ledger,
+    // and dueAmount is computed here rather than trusted from the client.
+    invoice: buildInvoice(body.invoice, undefined),
     notes: body.notes ?? "",
   } as Order;
   order.status = computeOverallStatus(order);
@@ -216,6 +222,11 @@ app.put("/api/orders/:id", async (c) => {
     body.staffAssigned = withServerOwnedPayFields(body.staffAssigned, existing.staffAssigned);
   }
 
+  // Owner edited the invoice fields: keep the stored payment ledger, and recompute the due amount from it.
+  if (body.invoice) {
+    body.invoice = buildInvoice(body.invoice, existing.invoice);
+  }
+
   const merged: Order = { ...existing, ...body, id: existing.id };
   merged.status = computeOverallStatus(merged);
 
@@ -225,6 +236,75 @@ app.put("/api/orders/:id", async (c) => {
   await db.ensureCustomerFromOrder(c.env.DB, order.customer);
 
   return c.json(auth.role === "staff" ? redactInvoiceForStaff(order) : order);
+});
+
+// Owner-only: record a payment the CUSTOMER made after the advance (e.g. total 2000,
+// advance 500 paid up front, then 500 more on a later date). It is stored with its
+// date, mode and note on `invoice.payments`, and the due amount is recomputed:
+// due = total - advance - sum(payments).
+app.post("/api/orders/:id/payments", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") return c.json({ error: "Only the owner can record payments." }, 403);
+
+  const orderId = c.req.param("id");
+  const body = (await c.req.json().catch(() => ({}))) as {
+    amount?: unknown;
+    date?: unknown;
+    mode?: unknown;
+    note?: unknown;
+  };
+
+  const order = await db.getOrder(c.env.DB, orderId);
+  if (!order) return c.json({ error: "Not found." }, 404);
+  const invoice = order.invoice ?? {};
+
+  const amount = toAmount(body.amount);
+  if (!(amount > 0)) return c.json({ error: "Enter an amount greater than 0." }, 400);
+
+  if (toAmount(invoice.totalAmount) <= 0) {
+    return c.json({ error: "Set the order's total amount first, then record payments." }, 400);
+  }
+  const due = dueOf(invoice);
+  if (due <= EPS) return c.json({ error: "This order is already paid in full." }, 409);
+  if (amount > due + EPS) {
+    return c.json({ error: `That is more than the remaining due (₹${money(due)}).` }, 400);
+  }
+
+  const payment: OrderPayment = {
+    id: crypto.randomUUID(),
+    amount: money(amount),
+    date: cleanDate(body.date),
+    mode: cleanMode(body.mode),
+    note: cleanNote(body.note),
+    createdAt: new Date().toISOString(),
+  };
+  const nextInvoice = buildInvoice(undefined, { ...invoice, payments: [...(invoice.payments ?? []), payment] });
+
+  const updated = await db.updateOrder(c.env.DB, orderId, { invoice: nextInvoice });
+  if (!updated) return c.json({ error: "Not found." }, 404);
+  return c.json(updated, 201);
+});
+
+// Owner-only: remove a wrongly recorded customer payment. The due amount goes back up accordingly.
+app.delete("/api/orders/:id/payments/:paymentId", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") return c.json({ error: "Only the owner can delete payments." }, 403);
+
+  const orderId = c.req.param("id");
+  const paymentId = c.req.param("paymentId");
+
+  const order = await db.getOrder(c.env.DB, orderId);
+  if (!order) return c.json({ error: "Not found." }, 404);
+  const invoice = order.invoice ?? {};
+
+  const before = invoice.payments ?? [];
+  const after = before.filter((p) => p.id !== paymentId);
+  if (after.length === before.length) return c.json({ error: "Payment not found." }, 404);
+
+  const nextInvoice = buildInvoice(undefined, { ...invoice, payments: after });
+  const updated = await db.updateOrder(c.env.DB, orderId, { invoice: nextInvoice });
+  if (!updated) return c.json({ error: "Not found." }, 404);
+  return c.json(updated);
 });
 
 app.delete("/api/orders/:id", async (c) => {

@@ -25,6 +25,34 @@ export interface StaffPayment {
   createdAt?: string;
 }
 
+/**
+ * One payment the CUSTOMER made against an order, after the advance.
+ * (The advance itself lives in `invoice.advancePaid` / `invoice.advanceDate`.)
+ */
+export interface OrderPayment {
+  id: string;
+  /** Rupees, as a string (like every other amount in the app). */
+  amount: string;
+  /** YYYY-MM-DD — the day the customer actually paid. */
+  date: string;
+  /** "UPI" | "Cash" | "Other" */
+  mode: string;
+  note: string;
+  createdAt?: string;
+}
+
+export interface OrderInvoice {
+  totalAmount?: string;
+  advancePaid?: string;
+  /** YYYY-MM-DD the advance was received. Optional (older orders don't have it). */
+  advanceDate?: string;
+  /** Server-computed: total - advance - sum(payments). */
+  dueAmount?: string;
+  paymentType?: string;
+  /** Server-owned ledger of payments after the advance. Missing on older orders -> []. */
+  payments?: OrderPayment[];
+}
+
 /** One entry of `order.staffAssigned[]`. */
 export interface StaffAssigned {
   staffId: string;
@@ -48,7 +76,7 @@ export type Order = HasId & {
   staffAssigned?: StaffAssigned[];
   program?: { type?: string; name?: string; imageUrl?: string };
   serviceType?: string;
-  invoice?: { totalAmount?: string; advancePaid?: string; dueAmount?: string; paymentType?: string };
+  invoice?: OrderInvoice;
 };
 
 export type Customer = HasId & {
