@@ -1,7 +1,18 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import type { Bindings, Customer, Order, StaffMember, CompletionStatus } from "./types";
+import type { Bindings, Customer, Order, StaffMember, CompletionStatus, StaffPayment } from "./types";
 import { nextOrderId, uniqueSlug } from "./ids";
+import {
+  cleanDate,
+  cleanMode,
+  cleanNote,
+  coerceStatus,
+  money,
+  settleIfCovered,
+  sumPayments,
+  toAmount,
+  withServerOwnedPayFields,
+} from "./staffPay";
 import * as db from "./db";
 
 export type Role = "owner" | "staff";
@@ -135,6 +146,7 @@ app.post("/api/orders", async (c) => {
       type: customerBody.type ?? "new",
       address: customerBody.address ?? "",
       location: customerBody.location ?? null,
+      referredBy: typeof customerBody.referredBy === "string" ? customerBody.referredBy.trim() : "",
     },
     serviceType: body.serviceType ?? "tenthouse",
     program: body.program ?? { type: "", name: "", imageUrl: "" },
@@ -148,10 +160,14 @@ app.post("/api/orders", async (c) => {
     // Staff can assign people to a job but can never set/charge an amount for
     // them — that's owner-only, enforced server-side (not just hidden in the
     // UI) so a direct API call can't sneak an amount in either.
-    staffAssigned: (body.staffAssigned ?? []).map((a) => ({
-      ...a,
-      amount: auth.role === "staff" ? "" : a.amount,
-    })),
+    // Payment status + advances are server-owned: a new assignment always starts "due" with no payments.
+    staffAssigned: withServerOwnedPayFields(
+      (body.staffAssigned ?? []).map((a) => ({
+        ...a,
+        amount: auth.role === "staff" ? "" : a.amount,
+      })),
+      undefined
+    ),
     invoice: body.invoice ?? { totalAmount: "", advancePaid: "", paymentType: "" },
     notes: body.notes ?? "",
   } as Order;
@@ -189,6 +205,15 @@ app.put("/api/orders/:id", async (c) => {
     delete (body as Partial<Order>).invoice;
     delete (body as Partial<Order>).paymentCompletionStatus;
     delete (body as Partial<Order>).staffAssigned;
+  }
+
+  // Tidy the "referred by" text if the customer block was sent.
+  if (body.customer && typeof body.customer.referredBy === "string") {
+    body.customer = { ...body.customer, referredBy: body.customer.referredBy.trim() };
+  }
+  // Owner edited the staff list: keep the stored paid/due status + advances for people who are still on it.
+  if (Array.isArray(body.staffAssigned)) {
+    body.staffAssigned = withServerOwnedPayFields(body.staffAssigned, existing.staffAssigned);
   }
 
   const merged: Order = { ...existing, ...body, id: existing.id };
@@ -233,6 +258,7 @@ app.post("/api/customers", async (c) => {
     type: body.type ?? "new",
     address: body.address ?? "",
     location: body.location ?? null,
+    referredBy: typeof body.referredBy === "string" ? body.referredBy.trim() : "",
   } as Customer;
   await db.insertCustomer(c.env.DB, customer);
   return c.json(customer, 201);
@@ -355,6 +381,8 @@ app.put("/api/staff/:staffId/assignments/:orderId", async (c) => {
     date?: string;
     program?: string;
     customerName?: string;
+    /** "paid" = fully settled, "due" = still owed (balance = amount - advances). */
+    paymentStatus?: string;
   };
 
   const order = await db.getOrder(c.env.DB, orderId);
@@ -366,8 +394,16 @@ app.put("/api/staff/:staffId/assignments/:orderId", async (c) => {
     return c.json({ error: "This staff member is not assigned to that order." }, 404);
   }
 
+  const amountChanged = typeof body.amount === "string" && money(toAmount(body.amount)) !== money(toAmount(staffAssigned[idx].amount));
   if (typeof body.amount === "string") {
     staffAssigned[idx] = { ...staffAssigned[idx], amount: body.amount.trim() };
+  }
+  if (body.paymentStatus === "paid" || body.paymentStatus === "due") {
+    // An explicit choice from the owner always wins.
+    staffAssigned[idx] = { ...staffAssigned[idx], paymentStatus: coerceStatus(body.paymentStatus) };
+  } else if (amountChanged) {
+    // Amount edited without touching the status: if advances now cover it, it's settled.
+    staffAssigned[idx] = settleIfCovered(staffAssigned[idx]);
   }
 
   const patch: Partial<Order> = { staffAssigned };
@@ -382,6 +418,103 @@ app.put("/api/staff/:staffId/assignments/:orderId", async (c) => {
   }
 
   const updated = await db.updateOrder(c.env.DB, orderId, patch);
+  if (!updated) return c.json({ error: "Not found." }, 404);
+  await db.syncStaffAssignmentsForOrder(c.env.DB, updated);
+
+  const staff = await db.getStaff(c.env.DB, staffId);
+  if (!staff) return c.json({ error: "Staff not found." }, 404);
+  const { pin: _pin, ...rest } = staff;
+  return c.json(rest);
+});
+
+// Owner-only: record an advance the owner handed to a staff member for one job
+// ("before the final payment"). It is stored with its info (date, mode, note)
+// on the order's staffAssigned entry and counts against that assignment's
+// amount: balance = amount - sum(advances). When the advances cover the whole
+// amount, the assignment flips to "paid" automatically.
+app.post("/api/staff/:staffId/assignments/:orderId/payments", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") {
+    return c.json({ error: "Only the owner can record payments." }, 403);
+  }
+
+  const staffId = c.req.param("staffId");
+  const orderId = c.req.param("orderId");
+  const body = (await c.req.json().catch(() => ({}))) as {
+    amount?: unknown;
+    date?: unknown;
+    mode?: unknown;
+    note?: unknown;
+  };
+
+  const order = await db.getOrder(c.env.DB, orderId);
+  if (!order) return c.json({ error: "Order not found." }, 404);
+
+  const staffAssigned = [...(order.staffAssigned ?? [])];
+  const idx = staffAssigned.findIndex((a) => a.staffId === staffId);
+  if (idx === -1) return c.json({ error: "This staff member is not assigned to that order." }, 404);
+  const entry = staffAssigned[idx];
+
+  const amount = toAmount(body.amount);
+  if (!(amount > 0)) return c.json({ error: "Enter an amount greater than 0." }, 400);
+
+  const total = toAmount(entry.amount);
+  if (total <= 0) {
+    return c.json({ error: "Set this staff member's amount for the order before recording payments." }, 400);
+  }
+  if (entry.paymentStatus === "paid") {
+    return c.json({ error: "This assignment is already marked Paid. Change it back to Due first to record another payment." }, 409);
+  }
+  const remaining = total - sumPayments(entry.payments);
+  if (amount > remaining + 0.005) {
+    return c.json({ error: `That is more than the remaining due (₹${money(Math.max(remaining, 0))}).` }, 400);
+  }
+
+  const payment: StaffPayment = {
+    id: crypto.randomUUID(),
+    amount: money(amount),
+    date: cleanDate(body.date),
+    mode: cleanMode(body.mode),
+    note: cleanNote(body.note),
+    createdAt: new Date().toISOString(),
+  };
+  staffAssigned[idx] = settleIfCovered({ ...entry, payments: [...(entry.payments ?? []), payment] });
+
+  const updated = await db.updateOrder(c.env.DB, orderId, { staffAssigned });
+  if (!updated) return c.json({ error: "Not found." }, 404);
+  await db.syncStaffAssignmentsForOrder(c.env.DB, updated);
+
+  const staff = await db.getStaff(c.env.DB, staffId);
+  if (!staff) return c.json({ error: "Staff not found." }, 404);
+  const { pin: _pin, ...rest } = staff;
+  return c.json(rest, 201);
+});
+
+// Owner-only: remove a wrongly recorded advance. The status is left as-is —
+// change it on the assignment's Edit row if it should go back to Due.
+app.delete("/api/staff/:staffId/assignments/:orderId/payments/:paymentId", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") {
+    return c.json({ error: "Only the owner can delete payments." }, 403);
+  }
+
+  const staffId = c.req.param("staffId");
+  const orderId = c.req.param("orderId");
+  const paymentId = c.req.param("paymentId");
+
+  const order = await db.getOrder(c.env.DB, orderId);
+  if (!order) return c.json({ error: "Order not found." }, 404);
+
+  const staffAssigned = [...(order.staffAssigned ?? [])];
+  const idx = staffAssigned.findIndex((a) => a.staffId === staffId);
+  if (idx === -1) return c.json({ error: "This staff member is not assigned to that order." }, 404);
+
+  const before = staffAssigned[idx].payments ?? [];
+  const after = before.filter((p) => p.id !== paymentId);
+  if (after.length === before.length) return c.json({ error: "Payment not found." }, 404);
+  staffAssigned[idx] = { ...staffAssigned[idx], payments: after };
+
+  const updated = await db.updateOrder(c.env.DB, orderId, { staffAssigned });
   if (!updated) return c.json({ error: "Not found." }, 404);
   await db.syncStaffAssignmentsForOrder(c.env.DB, updated);
 

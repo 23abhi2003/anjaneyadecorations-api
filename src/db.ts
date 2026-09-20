@@ -102,11 +102,14 @@ export async function insertCustomer(db: D1Database, customer: Customer): Promis
  */
 export async function ensureCustomerFromOrder(
   db: D1Database,
-  orderCustomer: { name?: string; phone?: string; type?: string; address?: string; location?: unknown } | undefined
+  orderCustomer:
+    | { name?: string; phone?: string; type?: string; address?: string; location?: unknown; referredBy?: unknown }
+    | undefined
 ): Promise<void> {
   const name = (orderCustomer?.name || "").trim();
   if (!name) return;
   const phone = (orderCustomer?.phone || "").trim();
+  const referredBy = typeof orderCustomer?.referredBy === "string" ? orderCustomer.referredBy.trim() : "";
 
   const all = await listCustomers(db);
   const existing = all.find((c) => {
@@ -115,10 +118,19 @@ export async function ensureCustomerFromOrder(
     return false;
   });
   if (existing) {
-    // Backfill a phone number onto an older record that didn't have one yet.
-    if (phone && !existing.phone) {
-      const merged: Customer = { ...existing, phone };
-      await db.prepare(`UPDATE customers SET phone = ?, data = ? WHERE id = ?`).bind(phone, JSON.stringify(merged), existing.id).run();
+    // Backfill a phone number and/or "referred by" onto an older record that didn't have one yet.
+    const needsPhone = !!phone && !existing.phone;
+    const needsReferral = !!referredBy && !existing.referredBy;
+    if (needsPhone || needsReferral) {
+      const merged: Customer = {
+        ...existing,
+        ...(needsPhone ? { phone } : {}),
+        ...(needsReferral ? { referredBy } : {}),
+      };
+      await db
+        .prepare(`UPDATE customers SET phone = ?, data = ? WHERE id = ?`)
+        .bind(merged.phone ?? "", JSON.stringify(merged), existing.id)
+        .run();
     }
     return;
   }
@@ -132,6 +144,7 @@ export async function ensureCustomerFromOrder(
     type: (orderCustomer?.type as Customer["type"]) || "new",
     address: orderCustomer?.address as string | undefined,
     location: (orderCustomer?.location ?? null) as Customer["location"],
+    referredBy,
   } as Customer;
   await insertCustomer(db, customer);
 }
@@ -256,6 +269,9 @@ export async function syncStaffAssignmentsForOrder(db: D1Database, order: Order)
             customerName,
             amount: currentAssignment.amount || "",
             date,
+            // Carried over from the order so a re-sync never wipes them.
+            paymentStatus: currentAssignment.paymentStatus === "paid" ? ("paid" as const) : ("due" as const),
+            payments: currentAssignment.payments ?? [],
           },
         ]
       : withoutThisOrder;

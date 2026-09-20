@@ -9,6 +9,33 @@ export interface HasId {
 
 export type CompletionStatus = "pending" | "completed";
 
+/** Has the owner fully settled what this staff member is owed for one job? */
+export type StaffPaymentStatus = "due" | "paid";
+
+/** One advance the owner handed to a staff member before the final settlement. */
+export interface StaffPayment {
+  id: string;
+  /** Rupees, as a string (like every other amount in the app). */
+  amount: string;
+  /** YYYY-MM-DD */
+  date: string;
+  /** "UPI" | "Cash" | "Other" */
+  mode: string;
+  note: string;
+  createdAt?: string;
+}
+
+/** One entry of `order.staffAssigned[]`. */
+export interface StaffAssigned {
+  staffId: string;
+  name: string;
+  amount: string;
+  /** Server-owned. Missing on older orders -> treated as "due". */
+  paymentStatus?: StaffPaymentStatus;
+  /** Server-owned advance ledger. Missing on older orders -> []. */
+  payments?: StaffPayment[];
+}
+
 export type Order = HasId & {
   customer?: { name?: string; phone?: string; [k: string]: unknown };
   eventDate?: string | null;
@@ -18,7 +45,7 @@ export type Order = HasId & {
   /** Has the invoice been paid in full? Owner-managed. */
   paymentCompletionStatus?: CompletionStatus;
   createdAt?: string;
-  staffAssigned?: Array<{ staffId: string; name: string; amount: string }>;
+  staffAssigned?: StaffAssigned[];
   program?: { type?: string; name?: string; imageUrl?: string };
   serviceType?: string;
   invoice?: { totalAmount?: string; advancePaid?: string; dueAmount?: string; paymentType?: string };
@@ -28,6 +55,8 @@ export type Customer = HasId & {
   name?: string;
   phone?: string;
   type?: "new" | "older";
+  /** Who referred this customer (free text). */
+  referredBy?: string;
 };
 
 export type StaffMember = HasId & {
@@ -41,6 +70,8 @@ export type StaffMember = HasId & {
     customerName: string;
     amount: string;
     date?: string;
+    paymentStatus?: StaffPaymentStatus;
+    payments?: StaffPayment[];
   }>;
 };
 
@@ -50,4 +81,4 @@ export type Bindings = {
   /** Owner login credentials (phone + 4-digit PIN). Set via `wrangler secret put` in production. */
   OWNER_PHONE?: string;
   OWNER_PIN?: string;
-};  
+};
