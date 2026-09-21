@@ -44,6 +44,11 @@ export function cleanNote(v: unknown): string {
   return typeof v === "string" ? v.trim().slice(0, 200) : "";
 }
 
+/** Reason for a borrow: trimmed, max 200 chars. Empty string if missing. */
+export function cleanReason(v: unknown): string {
+  return cleanNote(v);
+}
+
 /** Accepts YYYY-MM-DD only; falls back to today (server date) if missing/invalid. */
 export function cleanDate(v: unknown): string {
   if (typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v.trim())) return v.trim();
