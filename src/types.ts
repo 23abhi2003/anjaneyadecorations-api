@@ -25,6 +25,23 @@ export interface StaffPayment {
   createdAt?: string;
 }
 
+/**
+ * Money a staff member borrowed from the owner. Unlike `StaffPayment` (an
+ * advance against ONE order), a borrow belongs to the staff member as a whole:
+ * it is deducted from the total of ALL their assigned orders.
+ * remaining = sum(assignment amounts) - sum(borrows)
+ */
+export interface StaffBorrow {
+  id: string;
+  /** Rupees, as a string (like every other amount in the app). */
+  amount: string;
+  /** YYYY-MM-DD — the day the money was handed over. */
+  date: string;
+  /** Why they borrowed it. */
+  reason: string;
+  createdAt?: string;
+}
+
 /** One entry of `order.staffAssigned[]`. */
 export interface StaffAssigned {
   staffId: string;
@@ -64,6 +81,8 @@ export type StaffMember = HasId & {
   phone?: string;
   /** 4-digit login PIN. Never echoed back in list/get responses. */
   pin?: string;
+  /** Server-owned borrow ledger. Missing on older staff records -> []. */
+  borrows?: StaffBorrow[];
   assignments?: Array<{
     orderId: string;
     program: string;

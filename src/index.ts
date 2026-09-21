@@ -1,11 +1,12 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import type { Bindings, Customer, Order, StaffMember, CompletionStatus, StaffPayment } from "./types";
+import type { Bindings, Customer, Order, StaffMember, CompletionStatus, StaffPayment, StaffBorrow } from "./types";
 import { nextOrderId, uniqueSlug } from "./ids";
 import {
   cleanDate,
   cleanMode,
   cleanNote,
+  cleanReason,
   coerceStatus,
   money,
   settleIfCovered,
@@ -326,17 +327,31 @@ app.get("/api/customers/:id/orders", async (c) => {
 
 // ---------------- staff ----------------
 
+/**
+ * What a caller is allowed to see of a staff record: never the PIN, and a
+ * staff login only sees the borrow ledger of their OWN record (a colleague's
+ * loans are none of their business). The owner sees everything but the PIN.
+ */
+function publicStaff(staff: StaffMember, auth: CallerInfo): Omit<StaffMember, "pin"> {
+  const { pin: _pin, ...rest } = staff;
+  if (auth.role === "staff" && auth.staffId !== staff.id) {
+    const { borrows: _borrows, ...withoutBorrows } = rest;
+    return withoutBorrows;
+  }
+  return rest;
+}
+
 app.get("/api/staff", async (c) => {
+  const auth = c.get("auth");
   const staff = await db.listStaff(c.env.DB);
-  // Never send PINs back to the client.
-  return c.json(staff.map(({ pin: _pin, ...rest }) => rest));
+  return c.json(staff.map((s) => publicStaff(s, auth)));
 });
 
 app.get("/api/staff/:id", async (c) => {
+  const auth = c.get("auth");
   const staff = await db.getStaff(c.env.DB, c.req.param("id"));
   if (!staff) return c.json({ error: "Not found." }, 404);
-  const { pin: _pin, ...rest } = staff;
-  return c.json(rest);
+  return c.json(publicStaff(staff, auth));
 });
 
 app.post("/api/staff", async (c) => {
@@ -355,6 +370,7 @@ app.post("/api/staff", async (c) => {
     phone: body.phone ?? "",
     pin: body.pin ?? "",
     assignments: [],
+    borrows: [],
   } as StaffMember;
   await db.insertStaff(c.env.DB, staff);
   const { pin: _pin, ...rest } = staff;
@@ -521,6 +537,75 @@ app.delete("/api/staff/:staffId/assignments/:orderId/payments/:paymentId", async
   const staff = await db.getStaff(c.env.DB, staffId);
   if (!staff) return c.json({ error: "Staff not found." }, 404);
   const { pin: _pin, ...rest } = staff;
+  return c.json(rest);
+});
+
+// ---------------- staff borrows ----------------
+// Money a staff member borrowed from the owner (with a reason and a date).
+// It belongs to the staff member, not to one order: it is deducted from the
+// total of ALL their assigned orders — remaining = total of assignments - borrows.
+// The ledger lives on the staff record (`borrows[]`), so reading it needs no
+// extra endpoint: GET /api/staff and GET /api/staff/:id already include it.
+// A borrow can exceed what has been earned so far (staff often borrow before
+// the work is done), so the amount is deliberately NOT capped by the total.
+
+// Owner-only: record a borrow.
+app.post("/api/staff/:staffId/borrows", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") {
+    return c.json({ error: "Only the owner can record borrows." }, 403);
+  }
+
+  const staffId = c.req.param("staffId");
+  const body = (await c.req.json().catch(() => ({}))) as {
+    amount?: unknown;
+    date?: unknown;
+    reason?: unknown;
+  };
+
+  const staff = await db.getStaff(c.env.DB, staffId);
+  if (!staff) return c.json({ error: "Staff not found." }, 404);
+
+  const amount = toAmount(body.amount);
+  if (!(amount > 0)) return c.json({ error: "Enter an amount greater than 0." }, 400);
+
+  const reason = cleanReason(body.reason);
+  if (!reason) return c.json({ error: "Enter a reason for the borrow." }, 400);
+
+  const borrow: StaffBorrow = {
+    id: crypto.randomUUID(),
+    amount: money(amount),
+    date: cleanDate(body.date),
+    reason,
+    createdAt: new Date().toISOString(),
+  };
+
+  const updated = await db.updateStaffBorrows(c.env.DB, staffId, [...(staff.borrows ?? []), borrow]);
+  if (!updated) return c.json({ error: "Staff not found." }, 404);
+  const { pin: _pin, ...rest } = updated;
+  return c.json(rest, 201);
+});
+
+// Owner-only: remove a wrongly recorded borrow (or one that was paid back).
+app.delete("/api/staff/:staffId/borrows/:borrowId", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") {
+    return c.json({ error: "Only the owner can delete borrows." }, 403);
+  }
+
+  const staffId = c.req.param("staffId");
+  const borrowId = c.req.param("borrowId");
+
+  const staff = await db.getStaff(c.env.DB, staffId);
+  if (!staff) return c.json({ error: "Staff not found." }, 404);
+
+  const before = staff.borrows ?? [];
+  const after = before.filter((b) => b.id !== borrowId);
+  if (after.length === before.length) return c.json({ error: "Borrow not found." }, 404);
+
+  const updated = await db.updateStaffBorrows(c.env.DB, staffId, after);
+  if (!updated) return c.json({ error: "Staff not found." }, 404);
+  const { pin: _pin, ...rest } = updated;
   return c.json(rest);
 });
 

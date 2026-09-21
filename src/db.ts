@@ -1,4 +1,4 @@
-import type { Customer, Order, StaffMember } from "./types";
+import type { Customer, Order, StaffBorrow, StaffMember } from "./types";
 import { uniqueSlug } from "./ids";
 
 // ---------- orders ----------
@@ -222,6 +222,18 @@ export async function updateStaffProfile(
     .prepare(`UPDATE staff SET name = ?, phone = ?, pin = ?, data = ? WHERE id = ?`)
     .bind(merged.name ?? "", merged.phone ?? "", merged.pin ?? "", JSON.stringify(merged), id)
     .run();
+  return merged;
+}
+
+/**
+ * Replaces a staff member's borrow ledger and returns the updated record.
+ * Everything else on the record (profile, PIN, assignments) is left untouched.
+ */
+export async function updateStaffBorrows(db: D1Database, id: string, borrows: StaffBorrow[]): Promise<StaffMember | null> {
+  const existing = await getStaff(db, id);
+  if (!existing) return null;
+  const merged: StaffMember = { ...existing, borrows };
+  await db.prepare(`UPDATE staff SET data = ? WHERE id = ?`).bind(JSON.stringify(merged), id).run();
   return merged;
 }
 
