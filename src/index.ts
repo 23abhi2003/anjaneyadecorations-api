@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import type { Bindings, Customer, Order, StaffMember, CompletionStatus, StaffPayment, StaffBorrow } from "./types";
+import type { Bindings, Customer, Investment, InvestmentCategory, Order, StaffMember, CompletionStatus, StaffPayment, StaffBorrow } from "./types";
 import { nextOrderId, uniqueSlug } from "./ids";
 import {
   cleanDate,
@@ -325,6 +325,81 @@ app.get("/api/customers/:id/orders", async (c) => {
   return c.json(auth.role === "staff" ? orders.map(redactInvoiceForStaff) : orders);
 });
 
+// ---------------- investments ----------------
+// Owner-only in both directions: this is business spending data, not
+// something staff logins need to see or edit (mirrors the Invoices page).
+
+const INVESTMENT_CATEGORIES: InvestmentCategory[] = [
+  "decoration",
+  "tenthouse",
+  "lighting",
+  "dj",
+  "food",
+  "flowers",
+  "others",
+];
+
+function cleanInvestmentCategory(v: unknown): InvestmentCategory {
+  return INVESTMENT_CATEGORIES.includes(v as InvestmentCategory) ? (v as InvestmentCategory) : "others";
+}
+
+app.get("/api/investments", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") return c.json({ error: "Only the owner can view investments." }, 403);
+  const investments = await db.listInvestments(c.env.DB);
+  return c.json(investments);
+});
+
+app.post("/api/investments", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") return c.json({ error: "Only the owner can add investments." }, 403);
+
+  const body = (await c.req.json().catch(() => ({}))) as Partial<Investment>;
+  if (!body.name?.toString().trim()) {
+    return c.json({ error: "Name is required." }, 400);
+  }
+  if (!body.amount?.toString().trim() || Number.isNaN(parseFloat(String(body.amount)))) {
+    return c.json({ error: "A valid amount is required." }, 400);
+  }
+
+  const investment: Investment = {
+    id: crypto.randomUUID(),
+    name: body.name.toString().trim(),
+    category: cleanInvestmentCategory(body.category),
+    amount: String(body.amount).trim(),
+    date: body.date?.toString().trim() || new Date().toISOString().slice(0, 10),
+    createdAt: new Date().toISOString(),
+  };
+  await db.insertInvestment(c.env.DB, investment);
+  return c.json(investment, 201);
+});
+
+app.put("/api/investments/:id", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") return c.json({ error: "Only the owner can edit investments." }, 403);
+
+  const id = c.req.param("id");
+  const body = (await c.req.json().catch(() => ({}))) as Partial<Investment>;
+  const patch: Partial<Investment> = {};
+  if (typeof body.name === "string") patch.name = body.name.trim();
+  if (body.category !== undefined) patch.category = cleanInvestmentCategory(body.category);
+  if (typeof body.amount === "string" || typeof body.amount === "number") patch.amount = String(body.amount).trim();
+  if (typeof body.date === "string") patch.date = body.date.trim();
+
+  const updated = await db.updateInvestment(c.env.DB, id, patch);
+  if (!updated) return c.json({ error: "Not found." }, 404);
+  return c.json(updated);
+});
+
+app.delete("/api/investments/:id", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") return c.json({ error: "Only the owner can delete investments." }, 403);
+
+  const ok = await db.deleteInvestment(c.env.DB, c.req.param("id"));
+  if (!ok) return c.json({ error: "Not found." }, 404);
+  return c.json({ success: true });
+});
+
 // ---------------- staff ----------------
 
 /**
@@ -577,7 +652,6 @@ app.post("/api/staff/:staffId/borrows", async (c) => {
     amount: money(amount),
     date: cleanDate(body.date),
     reason,
-    paymentStatus: "due",
     createdAt: new Date().toISOString(),
   };
 
@@ -585,54 +659,6 @@ app.post("/api/staff/:staffId/borrows", async (c) => {
   if (!updated) return c.json({ error: "Staff not found." }, 404);
   const { pin: _pin, ...rest } = updated;
   return c.json(rest, 201);
-});
-
-// Owner-only: edit a borrow (amount/date/reason and whether it's been repaid).
-// "paymentStatus" is the only field a staff login can never touch — repayment
-// status, like everything else about borrows, is the owner's call.
-app.put("/api/staff/:staffId/borrows/:borrowId", async (c) => {
-  const auth = c.get("auth");
-  if (auth.role !== "owner") {
-    return c.json({ error: "Only the owner can edit borrows." }, 403);
-  }
-
-  const staffId = c.req.param("staffId");
-  const borrowId = c.req.param("borrowId");
-  const body = (await c.req.json().catch(() => ({}))) as {
-    amount?: unknown;
-    date?: unknown;
-    reason?: unknown;
-    paymentStatus?: unknown;
-  };
-
-  const staff = await db.getStaff(c.env.DB, staffId);
-  if (!staff) return c.json({ error: "Staff not found." }, 404);
-
-  const borrows = [...(staff.borrows ?? [])];
-  const idx = borrows.findIndex((b) => b.id === borrowId);
-  if (idx === -1) return c.json({ error: "Borrow not found." }, 404);
-
-  const next: StaffBorrow = { ...borrows[idx] };
-  if (body.amount !== undefined) {
-    const amount = toAmount(body.amount);
-    if (!(amount > 0)) return c.json({ error: "Enter an amount greater than 0." }, 400);
-    next.amount = money(amount);
-  }
-  if (body.date !== undefined) next.date = cleanDate(body.date);
-  if (body.reason !== undefined) {
-    const reason = cleanReason(body.reason);
-    if (!reason) return c.json({ error: "Enter a reason for the borrow." }, 400);
-    next.reason = reason;
-  }
-  if (body.paymentStatus === "paid" || body.paymentStatus === "due") {
-    next.paymentStatus = body.paymentStatus;
-  }
-  borrows[idx] = next;
-
-  const updated = await db.updateStaffBorrows(c.env.DB, staffId, borrows);
-  if (!updated) return c.json({ error: "Staff not found." }, 404);
-  const { pin: _pin, ...rest } = updated;
-  return c.json(rest);
 });
 
 // Owner-only: remove a wrongly recorded borrow (or one that was paid back).

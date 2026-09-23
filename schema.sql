@@ -39,3 +39,15 @@ CREATE TABLE IF NOT EXISTS staff (
 );
 CREATE INDEX IF NOT EXISTS idx_staff_name ON staff(name);
 CREATE INDEX IF NOT EXISTS idx_staff_phone ON staff(phone);
+
+CREATE TABLE IF NOT EXISTS investments (
+  id          TEXT PRIMARY KEY,
+  name        TEXT NOT NULL DEFAULT '', -- what it was for (free text)
+  category    TEXT NOT NULL DEFAULT 'others', -- decoration | tenthouse | lighting | dj | food | flowers | others
+  amount      TEXT NOT NULL DEFAULT '0',
+  date        TEXT NOT NULL DEFAULT '', -- YYYY-MM-DD
+  data        TEXT NOT NULL, -- full Investment JSON
+  inserted_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS idx_investments_category ON investments(category);
+CREATE INDEX IF NOT EXISTS idx_investments_date ON investments(date);

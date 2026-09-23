@@ -1,4 +1,4 @@
-import type { Customer, Order, StaffBorrow, StaffMember } from "./types";
+import type { Customer, Investment, Order, StaffBorrow, StaffMember } from "./types";
 import { uniqueSlug } from "./ids";
 
 // ---------- orders ----------
@@ -172,6 +172,50 @@ export async function deleteOrdersForCustomer(db: D1Database, customer: Customer
     await removeOrderFromAllStaffAssignments(db, order.id);
   }
   return orders.length;
+}
+
+// ---------- investments ----------
+
+export async function listInvestments(db: D1Database): Promise<Investment[]> {
+  const { results } = await db
+    .prepare("SELECT data FROM investments ORDER BY date DESC, inserted_at DESC, rowid DESC")
+    .all<{ data: string }>();
+  return results.map((r) => JSON.parse(r.data) as Investment);
+}
+
+export async function getInvestment(db: D1Database, id: string): Promise<Investment | null> {
+  const row = await db.prepare("SELECT data FROM investments WHERE id = ?").bind(id).first<{ data: string }>();
+  return row ? (JSON.parse(row.data) as Investment) : null;
+}
+
+export async function insertInvestment(db: D1Database, investment: Investment): Promise<void> {
+  await db
+    .prepare(`INSERT INTO investments (id, name, category, amount, date, data) VALUES (?, ?, ?, ?, ?, ?)`)
+    .bind(
+      investment.id,
+      investment.name ?? "",
+      investment.category ?? "others",
+      investment.amount ?? "0",
+      investment.date ?? "",
+      JSON.stringify(investment)
+    )
+    .run();
+}
+
+export async function updateInvestment(db: D1Database, id: string, patch: Partial<Investment>): Promise<Investment | null> {
+  const existing = await getInvestment(db, id);
+  if (!existing) return null;
+  const merged: Investment = { ...existing, ...patch, id: existing.id };
+  await db
+    .prepare(`UPDATE investments SET name = ?, category = ?, amount = ?, date = ?, data = ? WHERE id = ?`)
+    .bind(merged.name ?? "", merged.category ?? "others", merged.amount ?? "0", merged.date ?? "", JSON.stringify(merged), id)
+    .run();
+  return merged;
+}
+
+export async function deleteInvestment(db: D1Database, id: string): Promise<boolean> {
+  const res = await db.prepare("DELETE FROM investments WHERE id = ?").bind(id).run();
+  return (res.meta.changes ?? 0) > 0;
 }
 
 // ---------- staff ----------
