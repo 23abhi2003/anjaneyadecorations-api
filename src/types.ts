@@ -29,7 +29,7 @@ export interface StaffPayment {
  * Money a staff member borrowed from the owner. Unlike `StaffPayment` (an
  * advance against ONE order), a borrow belongs to the staff member as a whole:
  * it is deducted from the total of ALL their assigned orders.
- * remaining = sum(assignment amounts) - sum(borrows)
+ * remaining = sum(assignment amounts) - sum(borrows still "due")
  */
 export interface StaffBorrow {
   id: string;
@@ -39,6 +39,12 @@ export interface StaffBorrow {
   date: string;
   /** Why they borrowed it. */
   reason: string;
+  /**
+   * Has the staff member repaid this borrow (in cash, outside the payroll
+   * ledger)? "due" (default) still counts against their remaining balance;
+   * "paid" means it's settled and no longer subtracted. Owner-only to edit.
+   */
+  paymentStatus?: StaffPaymentStatus;
   createdAt?: string;
 }
 

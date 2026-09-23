@@ -577,6 +577,7 @@ app.post("/api/staff/:staffId/borrows", async (c) => {
     amount: money(amount),
     date: cleanDate(body.date),
     reason,
+    paymentStatus: "due",
     createdAt: new Date().toISOString(),
   };
 
@@ -584,6 +585,54 @@ app.post("/api/staff/:staffId/borrows", async (c) => {
   if (!updated) return c.json({ error: "Staff not found." }, 404);
   const { pin: _pin, ...rest } = updated;
   return c.json(rest, 201);
+});
+
+// Owner-only: edit a borrow (amount/date/reason and whether it's been repaid).
+// "paymentStatus" is the only field a staff login can never touch — repayment
+// status, like everything else about borrows, is the owner's call.
+app.put("/api/staff/:staffId/borrows/:borrowId", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") {
+    return c.json({ error: "Only the owner can edit borrows." }, 403);
+  }
+
+  const staffId = c.req.param("staffId");
+  const borrowId = c.req.param("borrowId");
+  const body = (await c.req.json().catch(() => ({}))) as {
+    amount?: unknown;
+    date?: unknown;
+    reason?: unknown;
+    paymentStatus?: unknown;
+  };
+
+  const staff = await db.getStaff(c.env.DB, staffId);
+  if (!staff) return c.json({ error: "Staff not found." }, 404);
+
+  const borrows = [...(staff.borrows ?? [])];
+  const idx = borrows.findIndex((b) => b.id === borrowId);
+  if (idx === -1) return c.json({ error: "Borrow not found." }, 404);
+
+  const next: StaffBorrow = { ...borrows[idx] };
+  if (body.amount !== undefined) {
+    const amount = toAmount(body.amount);
+    if (!(amount > 0)) return c.json({ error: "Enter an amount greater than 0." }, 400);
+    next.amount = money(amount);
+  }
+  if (body.date !== undefined) next.date = cleanDate(body.date);
+  if (body.reason !== undefined) {
+    const reason = cleanReason(body.reason);
+    if (!reason) return c.json({ error: "Enter a reason for the borrow." }, 400);
+    next.reason = reason;
+  }
+  if (body.paymentStatus === "paid" || body.paymentStatus === "due") {
+    next.paymentStatus = body.paymentStatus;
+  }
+  borrows[idx] = next;
+
+  const updated = await db.updateStaffBorrows(c.env.DB, staffId, borrows);
+  if (!updated) return c.json({ error: "Staff not found." }, 404);
+  const { pin: _pin, ...rest } = updated;
+  return c.json(rest);
 });
 
 // Owner-only: remove a wrongly recorded borrow (or one that was paid back).
