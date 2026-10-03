@@ -29,3 +29,16 @@ export function uniqueSlug(base: string, existingIds: string[]): string {
   }
   return id;
 }
+
+const RIDE_PREFIX = "VKMAR";
+
+/** Builds the next VKMAR-## id from the highest seq currently stored. */
+export function nextRideId(maxSeq: number | null): { id: string; seq: number } {
+  const next = (maxSeq ?? 0) + 1;
+  return { id: `${RIDE_PREFIX}-${String(next).padStart(2, "0")}`, seq: next };
+}
+
+export function seqFromRideId(id: string): number | null {
+  const m = new RegExp(`^${RIDE_PREFIX}-(\\d+)$`).exec(id);
+  return m ? parseInt(m[1], 10) : null;
+}

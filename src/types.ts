@@ -7,6 +7,8 @@ export interface HasId {
   [key: string]: unknown;
 }
 
+export type Role = "owner" | "staff" | "driver";
+
 export type CompletionStatus = "pending" | "completed";
 
 /** Has the owner fully settled what this staff member is owed for one job? */
@@ -115,3 +117,62 @@ export type Bindings = {
   OWNER_PHONE?: string;
   OWNER_PIN?: string;
 };
+
+export type AutoRideStatus = "completed" | "scheduled" | "cancelled";
+export type AutoRidePaymentStatus = "paid" | "due";
+
+export type AutoRide = HasId & {
+  customerName?: string;
+  customerPhone?: string;
+  driverAssigned?: string;
+  date?: string;
+  pickupLocation?: string;
+  dropLocation?: string;
+  totalAmount?: string;
+  advancePaid?: string;
+  dueAmount?: string;
+  driverPay?: string;
+  status?: AutoRideStatus;
+  paymentStatus?: AutoRidePaymentStatus;
+  notes?: string;
+  createdAt?: string;
+};
+
+export type AutoDieselEntry = HasId & {
+  date?: string;
+  type?: "diesel" | "repair";
+  litres?: string;
+  totalAmount?: string;
+  filledByDriver?: string;
+  stationOrVehicle?: string;
+  repairItem?: string;
+  notes?: string;
+  createdAt?: string;
+};
+
+export type AutoDriverPayout = HasId & {
+  driverName?: string;
+  amount?: string;
+  date?: string;
+  mode?: string;
+  note?: string;
+  createdAt?: string;
+};
+
+export interface AutoDriverBorrow {
+  id: string;
+  driverName: string;
+  amount: string;
+  date: string;
+  reason: string;
+  paymentStatus: StaffPaymentStatus;
+  createdAt?: string;
+}
+
+export interface AutoDriver {
+  id: string;
+  name: string;
+  phone: string;
+  pin?: string;
+  createdAt?: string;
+}

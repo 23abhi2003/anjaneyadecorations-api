@@ -1,4 +1,4 @@
-import type { Customer, Investment, Order, StaffBorrow, StaffMember } from "./types";
+import type { Customer, Investment, Order, StaffBorrow, StaffMember, AutoRide, AutoDieselEntry, AutoDriverPayout, AutoDriverBorrow, AutoDriver } from "./types";
 import { uniqueSlug } from "./ids";
 
 // ---------- orders ----------
@@ -346,4 +346,265 @@ export async function removeOrderFromAllStaffAssignments(db: D1Database, orderId
       await updateStaffAssignments(db, staff.id, filtered);
     }
   }
+}
+// ---------- auto rides ----------
+
+export async function maxAutoRideSeq(db: D1Database): Promise<number | null> {
+  const row = await db
+    .prepare("SELECT MAX(CAST(SUBSTR(id, 7) AS INTEGER)) as maxSeq FROM auto_rides WHERE id LIKE 'VKMAR-%'")
+    .first<{ maxSeq: number | null }>();
+  return row?.maxSeq ?? null;
+}
+
+export async function listAutoRides(db: D1Database): Promise<AutoRide[]> {
+  const { results } = await db
+    .prepare("SELECT data FROM auto_rides ORDER BY date DESC, inserted_at DESC, rowid DESC")
+    .all<{ data: string }>();
+  return results.map((r) => JSON.parse(r.data) as AutoRide);
+}
+
+export async function getAutoRide(db: D1Database, id: string): Promise<AutoRide | null> {
+  const row = await db.prepare("SELECT data FROM auto_rides WHERE id = ?").bind(id).first<{ data: string }>();
+  return row ? (JSON.parse(row.data) as AutoRide) : null;
+}
+
+export async function insertAutoRide(db: D1Database, ride: AutoRide): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO auto_rides (id, customer_name, customer_phone, driver_assigned, date, status, payment_status, total_amount, advance_paid, due_amount, driver_pay, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      ride.id,
+      ride.customerName ?? "",
+      ride.customerPhone ?? "",
+      ride.driverAssigned ?? "",
+      ride.date ?? "",
+      ride.status ?? "completed",
+      ride.paymentStatus ?? "paid",
+      ride.totalAmount ?? "0",
+      ride.advancePaid ?? "0",
+      ride.dueAmount ?? "0",
+      ride.driverPay ?? "0",
+      JSON.stringify(ride)
+    )
+    .run();
+}
+
+export async function updateAutoRide(db: D1Database, id: string, patch: Partial<AutoRide>): Promise<AutoRide | null> {
+  const existing = await getAutoRide(db, id);
+  if (!existing) return null;
+  const merged: AutoRide = { ...existing, ...patch, id: existing.id };
+  await db
+    .prepare(
+      `UPDATE auto_rides SET customer_name = ?, customer_phone = ?, driver_assigned = ?, date = ?, status = ?, payment_status = ?, total_amount = ?, advance_paid = ?, due_amount = ?, driver_pay = ?, data = ? WHERE id = ?`
+    )
+    .bind(
+      merged.customerName ?? "",
+      merged.customerPhone ?? "",
+      merged.driverAssigned ?? "",
+      merged.date ?? "",
+      merged.status ?? "completed",
+      merged.paymentStatus ?? "paid",
+      merged.totalAmount ?? "0",
+      merged.advancePaid ?? "0",
+      merged.dueAmount ?? "0",
+      merged.driverPay ?? "0",
+      JSON.stringify(merged),
+      id
+    )
+    .run();
+  return merged;
+}
+
+export async function deleteAutoRide(db: D1Database, id: string): Promise<boolean> {
+  const res = await db.prepare("DELETE FROM auto_rides WHERE id = ?").bind(id).run();
+  return (res.meta.changes ?? 0) > 0;
+}
+
+// ---------- auto diesel ----------
+
+export async function listAutoDiesel(db: D1Database): Promise<AutoDieselEntry[]> {
+  const { results } = await db
+    .prepare("SELECT data FROM auto_diesel ORDER BY date DESC, inserted_at DESC, rowid DESC")
+    .all<{ data: string }>();
+  return results.map((r) => JSON.parse(r.data) as AutoDieselEntry);
+}
+
+export async function getAutoDiesel(db: D1Database, id: string): Promise<AutoDieselEntry | null> {
+  const row = await db.prepare("SELECT data FROM auto_diesel WHERE id = ?").bind(id).first<{ data: string }>();
+  return row ? (JSON.parse(row.data) as AutoDieselEntry) : null;
+}
+
+export async function insertAutoDiesel(db: D1Database, entry: AutoDieselEntry): Promise<void> {
+  await db
+    .prepare(`INSERT INTO auto_diesel (id, date, total_amount, litres, filled_by_driver, data) VALUES (?, ?, ?, ?, ?, ?)`)
+    .bind(
+      entry.id,
+      entry.date ?? "",
+      entry.totalAmount ?? "0",
+      entry.litres ?? "",
+      entry.filledByDriver ?? "",
+      JSON.stringify(entry)
+    )
+    .run();
+}
+
+export async function deleteAutoDiesel(db: D1Database, id: string): Promise<boolean> {
+  const res = await db.prepare("DELETE FROM auto_diesel WHERE id = ?").bind(id).run();
+  return (res.meta.changes ?? 0) > 0;
+}
+
+// ---------- auto driver payouts ----------
+
+export async function listAutoDriverPayouts(db: D1Database): Promise<AutoDriverPayout[]> {
+  const { results } = await db
+    .prepare("SELECT data FROM auto_driver_payouts ORDER BY date DESC, inserted_at DESC, rowid DESC")
+    .all<{ data: string }>();
+  return results.map((r) => JSON.parse(r.data) as AutoDriverPayout);
+}
+
+export async function insertAutoDriverPayout(db: D1Database, payout: AutoDriverPayout): Promise<void> {
+  await db
+    .prepare(`INSERT INTO auto_driver_payouts (id, driver_name, amount, date, data) VALUES (?, ?, ?, ?, ?)`)
+    .bind(payout.id, payout.driverName ?? "", payout.amount ?? "0", payout.date ?? "", JSON.stringify(payout))
+    .run();
+}
+
+export async function deleteAutoDriverPayout(db: D1Database, id: string): Promise<boolean> {
+  const res = await db.prepare("DELETE FROM auto_driver_payouts WHERE id = ?").bind(id).run();
+  return (res.meta.changes ?? 0) > 0;
+}
+
+// ---------- auto driver borrows ----------
+
+export async function listAutoDriverBorrows(db: D1Database): Promise<AutoDriverBorrow[]> {
+  const { results } = await db
+    .prepare("SELECT data FROM auto_driver_borrows ORDER BY date DESC, inserted_at DESC, rowid DESC")
+    .all<{ data: string }>();
+  return results.map((r) => JSON.parse(r.data) as AutoDriverBorrow);
+}
+
+export async function insertAutoDriverBorrow(db: D1Database, borrow: AutoDriverBorrow): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO auto_driver_borrows (id, driver_name, amount, date, payment_status, reason, data) VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      borrow.id,
+      borrow.driverName ?? "",
+      borrow.amount ?? "0",
+      borrow.date ?? "",
+      borrow.paymentStatus ?? "due",
+      borrow.reason ?? "",
+      JSON.stringify(borrow)
+    )
+    .run();
+}
+
+export async function updateAutoDriverBorrow(
+  db: D1Database,
+  id: string,
+  patch: Partial<AutoDriverBorrow>
+): Promise<AutoDriverBorrow | null> {
+  const row = await db.prepare("SELECT data FROM auto_driver_borrows WHERE id = ?").bind(id).first<{ data: string }>();
+  if (!row) return null;
+  const existing = JSON.parse(row.data) as AutoDriverBorrow;
+  const merged: AutoDriverBorrow = { ...existing, ...patch, id: existing.id };
+  await db
+    .prepare(
+      `UPDATE auto_driver_borrows SET driver_name = ?, amount = ?, date = ?, payment_status = ?, reason = ?, data = ? WHERE id = ?`
+    )
+    .bind(
+      merged.driverName ?? "",
+      merged.amount ?? "0",
+      merged.date ?? "",
+      merged.paymentStatus ?? "due",
+      merged.reason ?? "",
+      JSON.stringify(merged),
+      id
+    )
+    .run();
+  return merged;
+}
+
+export async function deleteAutoDriverBorrow(db: D1Database, id: string): Promise<boolean> {
+  const res = await db.prepare("DELETE FROM auto_driver_borrows WHERE id = ?").bind(id).run();
+  return (res.meta.changes ?? 0) > 0;
+}
+
+// ---------- auto drivers ----------
+
+export async function listAutoDrivers(db: D1Database): Promise<AutoDriver[]> {
+  const { results } = await db
+    .prepare("SELECT data FROM auto_drivers ORDER BY inserted_at ASC, rowid ASC")
+    .all<{ data: string }>();
+  return results.map((r) => JSON.parse(r.data) as AutoDriver);
+}
+
+export async function insertAutoDriver(db: D1Database, driver: AutoDriver): Promise<void> {
+  await db
+    .prepare(`INSERT INTO auto_drivers (id, name, phone, pin, data) VALUES (?, ?, ?, ?, ?)`)
+    .bind(driver.id, driver.name ?? "", driver.phone ?? "", driver.pin ?? "", JSON.stringify(driver))
+    .run();
+}
+
+export async function updateAutoDriver(
+  db: D1Database,
+  id: string,
+  patch: Partial<AutoDriver>
+): Promise<AutoDriver | null> {
+  const row = await db.prepare("SELECT data FROM auto_drivers WHERE id = ?").bind(id).first<{ data: string }>();
+  if (!row) return null;
+  const existing = JSON.parse(row.data) as AutoDriver;
+  const merged: AutoDriver = { ...existing, ...patch, id: existing.id };
+  await db
+    .prepare(`UPDATE auto_drivers SET name = ?, phone = ?, pin = ?, data = ? WHERE id = ?`)
+    .bind(merged.name ?? "", merged.phone ?? "", merged.pin ?? "", JSON.stringify(merged), id)
+    .run();
+  return merged;
+}
+
+export async function deleteAutoDriver(db: D1Database, id: string): Promise<boolean> {
+  const res = await db.prepare("DELETE FROM auto_drivers WHERE id = ?").bind(id).run();
+  return (res.meta.changes ?? 0) > 0;
+}
+
+export async function getDriverByPhone(db: D1Database, phone: string): Promise<AutoDriver | null> {
+  const normalized = (phone || "").trim();
+  if (!normalized) return null;
+  const row = await db
+    .prepare("SELECT data FROM auto_drivers WHERE phone = ? LIMIT 1")
+    .bind(normalized)
+    .first<{ data: string }>();
+  return row ? (JSON.parse(row.data) as AutoDriver) : null;
+}
+
+export async function getDriverById(db: D1Database, id: string): Promise<AutoDriver | null> {
+  const row = await db.prepare("SELECT data FROM auto_drivers WHERE id = ? LIMIT 1").bind(id).first<{ data: string }>();
+  return row ? (JSON.parse(row.data) as AutoDriver) : null;
+}
+
+export async function updateAutoDiesel(
+  db: D1Database,
+  id: string,
+  patch: Partial<AutoDieselEntry>
+): Promise<AutoDieselEntry | null> {
+  const row = await db.prepare("SELECT data FROM auto_diesel WHERE id = ?").bind(id).first<{ data: string }>();
+  if (!row) return null;
+  const existing = JSON.parse(row.data) as AutoDieselEntry;
+  const merged: AutoDieselEntry = { ...existing, ...patch, id: existing.id };
+  await db
+    .prepare(
+      "UPDATE auto_diesel SET date = ?, total_amount = ?, litres = ?, filled_by_driver = ?, data = ? WHERE id = ?"
+    )
+    .bind(
+      merged.date ?? "",
+      merged.totalAmount ?? "0",
+      merged.litres ?? "",
+      merged.filledByDriver ?? "",
+      JSON.stringify(merged),
+      id
+    )
+    .run();
+  return merged;
 }
