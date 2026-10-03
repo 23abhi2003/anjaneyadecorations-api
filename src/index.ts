@@ -726,25 +726,33 @@ function redactRideForDriver(ride: AutoRide): AutoRide {
 
 app.get("/api/auto-rides", async (c) => {
   const auth = c.get("auth");
-  if (auth.role === "staff") {
-    return c.json({ error: "Access denied for staff." }, 403);
-  }
   const rides = await db.listAutoRides(c.env.DB);
-  if (auth.role === "driver") {
+  if (auth.role === "driver" || auth.role === "staff") {
     const driverName = (auth.userName || "").trim().toLowerCase();
     const myRides = rides.filter(
-      (r) => (r.driverAssigned || "").trim().toLowerCase() === driverName
+      (r) => !driverName || (r.driverAssigned || "").trim().toLowerCase() === driverName
     );
-    return c.json(myRides.map(redactRideForDriver));
+    // Return matching rides or all rides redacted if unassigned
+    const listToReturn = myRides.length > 0 ? myRides : rides;
+    return c.json(listToReturn.map(redactRideForDriver));
   }
   return c.json(rides);
 });
 
+app.get("/api/auto-rides/:id", async (c) => {
+  const auth = c.get("auth");
+  const id = c.req.param("id");
+  const ride = await db.getAutoRide(c.env.DB, id);
+  if (!ride) return c.json({ error: "Ride not found." }, 404);
+
+  if (auth.role === "driver" || auth.role === "staff") {
+    return c.json(redactRideForDriver(ride));
+  }
+  return c.json(ride);
+});
+
 app.post("/api/auto-rides", async (c) => {
   const auth = c.get("auth");
-  if (auth.role === "staff") {
-    return c.json({ error: "Access denied." }, 403);
-  }
   const body = (await c.req.json().catch(() => ({}))) as Partial<AutoRide>;
   if (!body.customerName?.toString().trim()) {
     return c.json({ error: "Customer name is required." }, 400);
@@ -759,7 +767,7 @@ app.post("/api/auto-rides", async (c) => {
   const advance = parseFloat(String(body.advancePaid || "0")) || 0;
   const due = Math.max(total - advance, 0);
 
-  const assignedDriver = (body.driverAssigned || (auth.role === "driver" && auth.userName ? auth.userName : "Unassigned")).toString().trim();
+  const assignedDriver = (body.driverAssigned || ((auth.role === "driver" || auth.role === "staff") && auth.userName ? auth.userName : "Unassigned")).toString().trim();
 
   let rideId = body.id?.trim();
   if (!rideId || rideId.startsWith("AR-")) {
@@ -792,13 +800,10 @@ app.post("/api/auto-rides", async (c) => {
 
 app.put("/api/auto-rides/:id", async (c) => {
   const auth = c.get("auth");
-  if (auth.role === "staff") {
-    return c.json({ error: "Access denied." }, 403);
-  }
   const id = c.req.param("id");
   const body = (await c.req.json().catch(() => ({}))) as Partial<AutoRide>;
 
-  if (auth.role === "driver") {
+  if (auth.role === "driver" || auth.role === "staff") {
     const existing = await db.getAutoRide(c.env.DB, id);
     if (!existing) return c.json({ error: "Ride not found." }, 404);
     if ((existing.driverAssigned || "").trim().toLowerCase() !== (auth.userName || "").trim().toLowerCase()) {
@@ -904,9 +909,8 @@ app.delete("/api/auto-diesel/:id", async (c) => {
 
 app.get("/api/auto-payouts", async (c) => {
   const auth = c.get("auth");
-  if (auth.role === "staff") return c.json({ error: "Forbidden." }, 403);
   const payouts = await db.listAutoDriverPayouts(c.env.DB);
-  if (auth.role === "driver") {
+  if (auth.role === "driver" || auth.role === "staff") {
     const driverName = (auth.userName || "").trim().toLowerCase();
     return c.json(payouts.filter((p) => (p.driverName || "").trim().toLowerCase() === driverName));
   }
@@ -950,9 +954,8 @@ app.delete("/api/auto-payouts/:id", async (c) => {
 
 app.get("/api/auto-borrows", async (c) => {
   const auth = c.get("auth");
-  if (auth.role === "staff") return c.json({ error: "Forbidden." }, 403);
   const borrows = await db.listAutoDriverBorrows(c.env.DB);
-  if (auth.role === "driver") {
+  if (auth.role === "driver" || auth.role === "staff") {
     const driverName = (auth.userName || "").trim().toLowerCase();
     return c.json(borrows.filter((b) => (b.driverName || "").trim().toLowerCase() === driverName));
   }
@@ -1002,7 +1005,6 @@ app.delete("/api/auto-borrows/:id", async (c) => {
 
 app.get("/api/auto-drivers", async (c) => {
   const auth = c.get("auth");
-  if (auth.role === "staff") return c.json({ error: "Forbidden." }, 403);
   const drivers = await db.listAutoDrivers(c.env.DB);
   const safeDrivers = drivers.map(({ pin: _pin, ...rest }) => rest);
   return c.json(safeDrivers);
