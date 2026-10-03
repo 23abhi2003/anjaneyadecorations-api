@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import type { Bindings, Customer, Investment, InvestmentCategory, Order, StaffMember, CompletionStatus, StaffPayment, StaffBorrow } from "./types";
-import { nextOrderId, uniqueSlug } from "./ids";
+import type { Bindings, Customer, Investment, InvestmentCategory, Order, StaffMember, CompletionStatus, StaffPayment, StaffBorrow, AutoRide, AutoDieselEntry, AutoDriverPayout, AutoDriverBorrow, AutoDriver } from "./types";
+import { nextOrderId, nextRideId, uniqueSlug } from "./ids";
 import {
   cleanDate,
   cleanMode,
@@ -16,7 +16,7 @@ import {
 } from "./staffPay";
 import * as db from "./db";
 
-export type Role = "owner" | "staff";
+export type Role = "owner" | "staff" | "driver";
 
 /**
  * No more signed tokens. The login endpoint just checks phone+PIN and hands
@@ -31,6 +31,8 @@ export type Role = "owner" | "staff";
 interface CallerInfo {
   role: Role;
   staffId?: string;
+  driverId?: string;
+  userName?: string;
 }
 
 const app = new Hono<{ Bindings: Bindings; Variables: { auth: CallerInfo } }>();
@@ -43,7 +45,7 @@ app.use("*", async (c, next) => {
   const corsMiddleware = cors({
     origin: allowed.includes("*") ? "*" : allowed,
     allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowHeaders: ["Content-Type", "X-User-Role", "X-User-Staff-Id"],
+    allowHeaders: ["Content-Type", "X-User-Role", "X-User-Staff-Id", "X-User-Driver-Id", "X-User-Name"],
   });
   return corsMiddleware(c, next);
 });
@@ -79,10 +81,16 @@ app.post("/api/auth/login", async (c) => {
   }
 
   const staff = await db.getStaffByPhone(c.env.DB, phone);
-  if (!staff || !staff.pin || staff.pin !== pin) {
-    return c.json({ error: "Invalid phone number or PIN." }, 401);
+  if (staff && staff.pin && staff.pin === pin) {
+    return c.json({ user: { role: "staff", phone: staff.phone, name: staff.name, staffId: staff.id } });
   }
-  return c.json({ user: { role: "staff", phone: staff.phone, name: staff.name, staffId: staff.id } });
+
+  const driver = await db.getDriverByPhone(c.env.DB, phone);
+  if (driver && driver.pin && driver.pin === pin) {
+    return c.json({ user: { role: "driver", phone: driver.phone, name: driver.name, driverId: driver.id } });
+  }
+
+  return c.json({ error: "Invalid phone number or PIN." }, 401);
 });
 
 // Every other /api/* route reads the caller's role/staffId off plain headers
@@ -91,9 +99,11 @@ app.post("/api/auth/login", async (c) => {
 // default, matching the old no-auth behavior of this API.
 app.use("/api/*", async (c, next) => {
   const headerRole = c.req.header("X-User-Role");
-  const role: Role = headerRole === "staff" ? "staff" : "owner";
+  const role: Role = headerRole === "staff" ? "staff" : headerRole === "driver" ? "driver" : "owner";
   const staffId = c.req.header("X-User-Staff-Id") || undefined;
-  c.set("auth", { role, staffId });
+  const driverId = c.req.header("X-User-Driver-Id") || undefined;
+  const userName = c.req.header("X-User-Name") || undefined;
+  c.set("auth", { role, staffId, driverId, userName });
   return next();
 });
 
@@ -700,6 +710,347 @@ app.put("/api/staff/:id", async (c) => {
   if (!updated) return c.json({ error: "Not found." }, 404);
   const { pin: _pin, ...rest } = updated;
   return c.json(rest);
+});
+
+
+// ---------------- auto rides (Anjaneya auto rentals VKM) ----------------
+
+function redactRideForDriver(ride: AutoRide): AutoRide {
+  return {
+    ...ride,
+    totalAmount: "",
+    advancePaid: "",
+    dueAmount: "",
+  };
+}
+
+app.get("/api/auto-rides", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role === "staff") {
+    return c.json({ error: "Access denied for staff." }, 403);
+  }
+  const rides = await db.listAutoRides(c.env.DB);
+  if (auth.role === "driver") {
+    const driverName = (auth.userName || "").trim().toLowerCase();
+    const myRides = rides.filter(
+      (r) => (r.driverAssigned || "").trim().toLowerCase() === driverName
+    );
+    return c.json(myRides.map(redactRideForDriver));
+  }
+  return c.json(rides);
+});
+
+app.post("/api/auto-rides", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role === "staff") {
+    return c.json({ error: "Access denied." }, 403);
+  }
+  const body = (await c.req.json().catch(() => ({}))) as Partial<AutoRide>;
+  if (!body.customerName?.toString().trim()) {
+    return c.json({ error: "Customer name is required." }, 400);
+  }
+  if (auth.role === "owner") {
+    if (!body.totalAmount?.toString().trim() || Number.isNaN(parseFloat(String(body.totalAmount)))) {
+      return c.json({ error: "A valid total amount is required." }, 400);
+    }
+  }
+
+  const total = parseFloat(String(body.totalAmount || "0")) || 0;
+  const advance = parseFloat(String(body.advancePaid || "0")) || 0;
+  const due = Math.max(total - advance, 0);
+
+  const assignedDriver = (body.driverAssigned || (auth.role === "driver" && auth.userName ? auth.userName : "Unassigned")).toString().trim();
+
+  let rideId = body.id?.trim();
+  if (!rideId || rideId.startsWith("AR-")) {
+    const maxSeq = await db.maxAutoRideSeq(c.env.DB);
+    const { id } = nextRideId(maxSeq);
+    rideId = id;
+  }
+
+  const ride: AutoRide = {
+    id: rideId,
+    customerName: body.customerName.toString().trim(),
+    customerPhone: (body.customerPhone || "").toString().trim(),
+    driverAssigned: assignedDriver,
+    pickupLocation: (body.pickupLocation || "").toString().trim(),
+    dropLocation: (body.dropLocation || "").toString().trim(),
+    date: body.date?.toString().trim() || new Date().toISOString().slice(0, 10),
+    totalAmount: auth.role === "owner" ? String(total) : "0",
+    advancePaid: auth.role === "owner" ? String(advance) : "0",
+    dueAmount: auth.role === "owner" ? String(due) : "0",
+    driverPay: auth.role === "owner" ? String(parseFloat(String(body.driverPay || "0")) || 0) : "0",
+    status: body.status || "completed",
+    paymentStatus: auth.role === "owner" ? (body.paymentStatus || (due === 0 && total > 0 ? "paid" : "due")) : "due",
+    notes: (body.notes || "").toString().trim(),
+    createdAt: new Date().toISOString(),
+  };
+
+  await db.insertAutoRide(c.env.DB, ride);
+  return c.json(ride, 201);
+});
+
+app.put("/api/auto-rides/:id", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role === "staff") {
+    return c.json({ error: "Access denied." }, 403);
+  }
+  const id = c.req.param("id");
+  const body = (await c.req.json().catch(() => ({}))) as Partial<AutoRide>;
+
+  if (auth.role === "driver") {
+    const existing = await db.getAutoRide(c.env.DB, id);
+    if (!existing) return c.json({ error: "Ride not found." }, 404);
+    if ((existing.driverAssigned || "").trim().toLowerCase() !== (auth.userName || "").trim().toLowerCase()) {
+      return c.json({ error: "You can only update your own assigned rides." }, 403);
+    }
+    const patch: Partial<AutoRide> = {};
+    if (body.status !== undefined) patch.status = body.status;
+    const updated = await db.updateAutoRide(c.env.DB, id, patch);
+    return c.json(updated ? redactRideForDriver(updated) : null);
+  }
+
+  const patch: Partial<AutoRide> = {};
+  if (typeof body.customerName === "string") patch.customerName = body.customerName.trim();
+  if (typeof body.customerPhone === "string") patch.customerPhone = body.customerPhone.trim();
+  if (typeof body.driverAssigned === "string") patch.driverAssigned = body.driverAssigned.trim();
+  if (typeof body.pickupLocation === "string") patch.pickupLocation = body.pickupLocation.trim();
+  if (typeof body.dropLocation === "string") patch.dropLocation = body.dropLocation.trim();
+  if (typeof body.date === "string") patch.date = body.date.trim();
+  if (body.totalAmount !== undefined) patch.totalAmount = String(body.totalAmount).trim();
+  if (body.advancePaid !== undefined) patch.advancePaid = String(body.advancePaid).trim();
+  if (body.dueAmount !== undefined) patch.dueAmount = String(body.dueAmount).trim();
+  if (body.driverPay !== undefined) patch.driverPay = String(body.driverPay).trim();
+  if (body.status !== undefined) patch.status = body.status;
+  if (body.paymentStatus !== undefined) patch.paymentStatus = body.paymentStatus;
+  if (typeof body.notes === "string") patch.notes = body.notes.trim();
+
+  const updated = await db.updateAutoRide(c.env.DB, id, patch);
+  if (!updated) return c.json({ error: "Not found." }, 404);
+  return c.json(updated);
+});
+
+app.delete("/api/auto-rides/:id", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") {
+    return c.json({ error: "Only the owner can delete rides." }, 403);
+  }
+  const ok = await db.deleteAutoRide(c.env.DB, c.req.param("id"));
+  if (!ok) return c.json({ error: "Not found." }, 404);
+  return c.json({ success: true });
+});
+
+// ---------------- auto diesel and repair (investments) ----------------
+
+app.get("/api/auto-diesel", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") {
+    return c.json({ error: "Only the owner can view diesel and repair expenses." }, 403);
+  }
+  const entries = await db.listAutoDiesel(c.env.DB);
+  return c.json(entries);
+});
+
+app.post("/api/auto-diesel", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") {
+    return c.json({ error: "Only the owner can log diesel or repair expenses." }, 403);
+  }
+  const body = (await c.req.json().catch(() => ({}))) as Partial<AutoDieselEntry>;
+  if (!body.totalAmount?.toString().trim() || Number.isNaN(parseFloat(String(body.totalAmount)))) {
+    return c.json({ error: "A valid amount is required." }, 400);
+  }
+
+  const isRepair = body.type === "repair";
+  const prefix = isRepair ? "REP" : "DL";
+  const entry: AutoDieselEntry = {
+    id: body.id?.trim() || `${prefix}-${String(Date.now()).slice(-4)}`,
+    date: body.date?.toString().trim() || new Date().toISOString().slice(0, 10),
+    type: isRepair ? "repair" : "diesel",
+    totalAmount: String(body.totalAmount).trim(),
+    litres: (body.litres || "").toString().trim(),
+    filledByDriver: (body.filledByDriver || "").toString().trim(),
+    stationOrVehicle: (body.stationOrVehicle || "").toString().trim(),
+    repairItem: (body.repairItem || "").toString().trim(),
+    notes: (body.notes || "").toString().trim(),
+    createdAt: new Date().toISOString(),
+  };
+
+  await db.insertAutoDiesel(c.env.DB, entry);
+  return c.json(entry, 201);
+});
+
+app.put("/api/auto-diesel/:id", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") return c.json({ error: "Only the owner can edit expenses." }, 403);
+  const id = c.req.param("id");
+  const body = (await c.req.json().catch(() => ({}))) as Partial<AutoDieselEntry>;
+  const updated = await db.updateAutoDiesel(c.env.DB, id, body);
+  if (!updated) return c.json({ error: "Entry not found." }, 404);
+  return c.json(updated);
+});
+
+app.delete("/api/auto-diesel/:id", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") {
+    return c.json({ error: "Only the owner can delete diesel or repair entries." }, 403);
+  }
+  const ok = await db.deleteAutoDiesel(c.env.DB, c.req.param("id"));
+  if (!ok) return c.json({ error: "Not found." }, 404);
+  return c.json({ success: true });
+});
+
+// ---------------- auto driver payouts ----------------
+
+app.get("/api/auto-payouts", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role === "staff") return c.json({ error: "Forbidden." }, 403);
+  const payouts = await db.listAutoDriverPayouts(c.env.DB);
+  if (auth.role === "driver") {
+    const driverName = (auth.userName || "").trim().toLowerCase();
+    return c.json(payouts.filter((p) => (p.driverName || "").trim().toLowerCase() === driverName));
+  }
+  return c.json(payouts);
+});
+
+app.post("/api/auto-payouts", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") return c.json({ error: "Only the owner can record payouts." }, 403);
+  const body = (await c.req.json().catch(() => ({}))) as Partial<AutoDriverPayout>;
+  if (!body.driverName?.toString().trim()) {
+    return c.json({ error: "Driver name is required." }, 400);
+  }
+  if (!body.amount?.toString().trim() || Number.isNaN(parseFloat(String(body.amount)))) {
+    return c.json({ error: "A valid amount is required." }, 400);
+  }
+
+  const payout: AutoDriverPayout = {
+    id: body.id?.trim() || `PAY-${String(Date.now()).slice(-4)}`,
+    driverName: body.driverName.toString().trim(),
+    amount: String(body.amount).trim(),
+    date: body.date?.toString().trim() || new Date().toISOString().slice(0, 10),
+    mode: (body.mode || "Cash").toString().trim(),
+    note: (body.note || "").toString().trim(),
+    createdAt: new Date().toISOString(),
+  };
+
+  await db.insertAutoDriverPayout(c.env.DB, payout);
+  return c.json(payout, 201);
+});
+
+app.delete("/api/auto-payouts/:id", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") return c.json({ error: "Only the owner can delete payouts." }, 403);
+  const ok = await db.deleteAutoDriverPayout(c.env.DB, c.req.param("id"));
+  if (!ok) return c.json({ error: "Not found." }, 404);
+  return c.json({ success: true });
+});
+
+// ---------------- Auto Driver Borrows Endpoints ----------------
+
+app.get("/api/auto-borrows", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role === "staff") return c.json({ error: "Forbidden." }, 403);
+  const borrows = await db.listAutoDriverBorrows(c.env.DB);
+  if (auth.role === "driver") {
+    const driverName = (auth.userName || "").trim().toLowerCase();
+    return c.json(borrows.filter((b) => (b.driverName || "").trim().toLowerCase() === driverName));
+  }
+  return c.json(borrows);
+});
+
+app.post("/api/auto-borrows", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") return c.json({ error: "Only the owner can record borrows." }, 403);
+  const body = (await c.req.json().catch(() => ({}))) as Partial<AutoDriverBorrow>;
+  if (!body.driverName || !body.amount) {
+    return c.json({ error: "driverName and amount are required" }, 400);
+  }
+  const borrow: AutoDriverBorrow = {
+    id: body.id || `BOR-${String(Date.now()).slice(-4)}`,
+    driverName: body.driverName.trim(),
+    amount: String(body.amount).trim(),
+    date: body.date || new Date().toISOString().slice(0, 10),
+    reason: body.reason || "",
+    paymentStatus: body.paymentStatus === "paid" ? "paid" : "due",
+    createdAt: new Date().toISOString(),
+  };
+  await db.insertAutoDriverBorrow(c.env.DB, borrow);
+  return c.json(borrow, 201);
+});
+
+app.put("/api/auto-borrows/:id", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") return c.json({ error: "Only the owner can edit borrows." }, 403);
+  const id = c.req.param("id");
+  const body = (await c.req.json().catch(() => ({}))) as Partial<AutoDriverBorrow>;
+  const updated = await db.updateAutoDriverBorrow(c.env.DB, id, body);
+  if (!updated) return c.json({ error: "Borrow record not found" }, 404);
+  return c.json(updated);
+});
+
+app.delete("/api/auto-borrows/:id", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") return c.json({ error: "Only the owner can delete borrows." }, 403);
+  const id = c.req.param("id");
+  const deleted = await db.deleteAutoDriverBorrow(c.env.DB, id);
+  if (!deleted) return c.json({ error: "Borrow record not found" }, 404);
+  return c.json({ ok: true });
+});
+
+// ---------------- Auto Drivers Endpoints ----------------
+
+app.get("/api/auto-drivers", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role === "staff") return c.json({ error: "Forbidden." }, 403);
+  const drivers = await db.listAutoDrivers(c.env.DB);
+  const safeDrivers = drivers.map(({ pin: _pin, ...rest }) => rest);
+  return c.json(safeDrivers);
+});
+
+app.post("/api/auto-drivers", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") return c.json({ error: "Only the owner can add drivers." }, 403);
+  const body = (await c.req.json().catch(() => ({}))) as Partial<AutoDriver>;
+  if (!body.name?.toString().trim()) {
+    return c.json({ error: "name is required" }, 400);
+  }
+  const driver: AutoDriver = {
+    id: body.id || "drv_" + Date.now(),
+    name: body.name.toString().trim(),
+    phone: (body.phone || "").toString().trim(),
+    pin: (body.pin || "").toString().trim(),
+    createdAt: new Date().toISOString(),
+  };
+  await db.insertAutoDriver(c.env.DB, driver);
+  const { pin: _pin, ...rest } = driver;
+  return c.json(rest, 201);
+});
+
+app.put("/api/auto-drivers/:id", async (c) => {
+  const auth = c.get("auth");
+  const id = c.req.param("id");
+  if (auth.role !== "owner" && auth.driverId !== id) {
+    return c.json({ error: "Forbidden." }, 403);
+  }
+  const body = (await c.req.json().catch(() => ({}))) as Partial<AutoDriver>;
+  const patch: Partial<AutoDriver> = {};
+  if (typeof body.name === "string") patch.name = body.name.trim();
+  if (typeof body.phone === "string") patch.phone = body.phone.trim();
+  if (typeof body.pin === "string") patch.pin = body.pin.trim();
+  const updated = await db.updateAutoDriver(c.env.DB, id, patch);
+  if (!updated) return c.json({ error: "Driver record not found" }, 404);
+  const { pin: _pin, ...rest } = updated;
+  return c.json(rest);
+});
+
+app.delete("/api/auto-drivers/:id", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") return c.json({ error: "Only the owner can delete drivers." }, 403);
+  const id = c.req.param("id");
+  const deleted = await db.deleteAutoDriver(c.env.DB, id);
+  if (!deleted) return c.json({ error: "Driver not found" }, 404);
+  return c.json({ ok: true });
 });
 
 app.onError((err, c) => {
