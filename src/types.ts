@@ -53,6 +53,8 @@ export interface StaffAssigned {
   paymentStatus?: StaffPaymentStatus;
   /** Server-owned advance ledger. Missing on older orders -> []. */
   payments?: StaffPayment[];
+  settlementNumber?: number;
+  settledAt?: string;
 }
 
 export type Order = HasId & {
@@ -84,6 +86,7 @@ export type StaffMember = HasId & {
   /** 4-digit login PIN. Never echoed back in list/get responses. */
   pin?: string;
   /** Server-owned borrow ledger. Missing on older staff records -> []. */
+  lastSettlement?: number;
   borrows?: StaffBorrow[];
   assignments?: Array<{
     orderId: string;
@@ -93,6 +96,8 @@ export type StaffMember = HasId & {
     date?: string;
     paymentStatus?: StaffPaymentStatus;
     payments?: StaffPayment[];
+    settlementNumber?: number;
+    settledAt?: string;
   }>;
 };
 

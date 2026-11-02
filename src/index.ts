@@ -625,6 +625,78 @@ app.delete("/api/staff/:staffId/assignments/:orderId/payments/:paymentId", async
   return c.json(rest);
 });
 
+
+// Owner-only: create or advance a settlement batch for a staff member.
+// Moves eligible paid orders (or specified orderIds) into settlement #{settlementNumber}
+// and updates the staff member's lastSettlement sequence.
+app.post("/api/staff/:staffId/settlements", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") {
+    return c.json({ error: "Only the owner can manage settlements." }, 403);
+  }
+
+  const staffId = c.req.param("staffId");
+  const body = (await c.req.json().catch(() => ({}))) as {
+    settlementNumber?: number;
+    orderIds?: string[];
+  };
+
+  const staff = await db.getStaff(c.env.DB, staffId);
+  if (!staff) return c.json({ error: "Staff member not found." }, 404);
+
+  const existingMax = Math.max(
+    staff.lastSettlement || 1,
+    ...(staff.assignments || []).map((a) => a.settlementNumber || 0)
+  );
+
+  const targetNumber =
+    body.settlementNumber && Number(body.settlementNumber) > 0
+      ? Number(body.settlementNumber)
+      : existingMax + 1;
+
+  const targetOrderIds =
+    Array.isArray(body.orderIds) && body.orderIds.length > 0 ? new Set(body.orderIds) : null;
+
+  const today = new Date().toISOString().slice(0, 10);
+
+  const orders = await db.listOrders(c.env.DB);
+  for (const o of orders) {
+    if (!o.staffAssigned) continue;
+    let orderChanged = false;
+    const updatedStaffAssigned = o.staffAssigned.map((a) => {
+      if (a.staffId !== staffId) return a;
+      const isTarget = targetOrderIds
+        ? targetOrderIds.has(o.id)
+        : a.paymentStatus === "paid" && (!a.settlementNumber || a.settlementNumber < targetNumber);
+
+      if (isTarget) {
+        orderChanged = true;
+        return {
+          ...a,
+          paymentStatus: "paid" as const,
+          settlementNumber: targetNumber,
+          settledAt: a.settledAt || today,
+        };
+      }
+      return a;
+    });
+
+    if (orderChanged) {
+      const updatedOrder = await db.updateOrder(c.env.DB, o.id, { staffAssigned: updatedStaffAssigned });
+      if (updatedOrder) {
+        await db.syncStaffAssignmentsForOrder(c.env.DB, updatedOrder);
+      }
+    }
+  }
+
+  await db.updateStaffLastSettlement(c.env.DB, staffId, Math.max(targetNumber, staff.lastSettlement || 1));
+
+  const refreshedStaff = await db.getStaff(c.env.DB, staffId);
+  if (!refreshedStaff) return c.json({ error: "Staff not found." }, 404);
+  const { pin: _pin, ...rest } = refreshedStaff;
+  return c.json(rest);
+});
+
 // ---------------- staff borrows ----------------
 // Money a staff member borrowed from the owner (with a reason and a date).
 // It belongs to the staff member, not to one order: it is deducted from the

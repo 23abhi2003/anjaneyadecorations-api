@@ -281,6 +281,22 @@ export async function updateStaffBorrows(db: D1Database, id: string, borrows: St
   return merged;
 }
 
+
+export async function updateStaffLastSettlement(
+  db: D1Database,
+  id: string,
+  lastSettlement: number
+): Promise<StaffMember | null> {
+  const existing = await getStaff(db, id);
+  if (!existing) return null;
+  const merged: StaffMember = { ...existing, lastSettlement };
+  await db
+    .prepare("UPDATE staff SET data = ? WHERE id = ?")
+    .bind(JSON.stringify(merged), id)
+    .run();
+  return merged;
+}
+
 export async function updateStaffAssignments(db: D1Database, id: string, assignments: StaffMember["assignments"]): Promise<void> {
   const existing = await getStaff(db, id);
   if (!existing) return;
