@@ -33,6 +33,8 @@ export interface StaffPayment {
  * it is deducted from the total of ALL their assigned orders.
  * remaining = sum(assignment amounts) - sum(borrows)
  */
+export type StaffBorrowStatus = "due" | "paid" | "settled";
+
 export interface StaffBorrow {
   id: string;
   /** Rupees, as a string (like every other amount in the app). */
@@ -41,6 +43,9 @@ export interface StaffBorrow {
   date: string;
   /** Why they borrowed it. */
   reason: string;
+  paymentStatus?: StaffBorrowStatus;
+  settlementNumber?: number;
+  settledAt?: string;
   createdAt?: string;
 }
 

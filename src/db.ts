@@ -344,6 +344,8 @@ export async function syncStaffAssignmentsForOrder(db: D1Database, order: Order)
             // Carried over from the order so a re-sync never wipes them.
             paymentStatus: currentAssignment.paymentStatus === "paid" ? ("paid" as const) : ("due" as const),
             payments: currentAssignment.payments ?? [],
+            settlementNumber: currentAssignment.settlementNumber,
+            settledAt: currentAssignment.settledAt,
           },
         ]
       : withoutThisOrder;

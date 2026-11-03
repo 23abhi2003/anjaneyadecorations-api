@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import type { Bindings, Customer, Investment, InvestmentCategory, Order, StaffMember, CompletionStatus, StaffPayment, StaffBorrow, AutoRide, AutoDieselEntry, AutoDriverPayout, AutoDriverBorrow, AutoDriver } from "./types";
+import type { Bindings, Customer, Investment, InvestmentCategory, Order, StaffMember, CompletionStatus, StaffPayment, StaffPaymentStatus, StaffBorrow, StaffBorrowStatus, AutoRide, AutoDieselEntry, AutoDriverPayout, AutoDriverBorrow, AutoDriver } from "./types";
 import { nextOrderId, nextRideId, uniqueSlug } from "./ids";
 import {
   cleanDate,
@@ -426,17 +426,64 @@ function publicStaff(staff: StaffMember, auth: CallerInfo): Omit<StaffMember, "p
   return rest;
 }
 
+function reconcileStaffAssignmentsWithOrders(staffList: StaffMember[], orders: Order[]): StaffMember[] {
+  const orderStaffMap = new Map<string, { settlementNumber?: number; settledAt?: string; paymentStatus?: StaffPaymentStatus }>();
+  for (const o of orders) {
+    for (const a of (o.staffAssigned || [])) {
+      if (a.staffId) {
+        orderStaffMap.set(`${a.staffId}:${o.id}`, {
+          settlementNumber: a.settlementNumber,
+          settledAt: a.settledAt,
+          paymentStatus: a.paymentStatus,
+        });
+      }
+    }
+  }
+
+  return staffList.map((s) => {
+    const assignments = (s.assignments || []).map((a) => {
+      const match = orderStaffMap.get(`${s.id}:${a.orderId}`);
+      if (match) {
+        let aCopy = a;
+        if (match.settlementNumber !== undefined && match.settlementNumber !== a.settlementNumber) {
+          aCopy = { ...aCopy, settlementNumber: match.settlementNumber, settledAt: match.settledAt || aCopy.settledAt };
+        }
+        if (match.paymentStatus && match.paymentStatus !== a.paymentStatus) {
+          aCopy = { ...aCopy, paymentStatus: match.paymentStatus };
+        }
+        return aCopy;
+      }
+      return a;
+    });
+
+    const maxSettlement = Math.max(
+      s.lastSettlement || 0,
+      ...assignments.map((a) => a.settlementNumber || 0)
+    );
+
+    return {
+      ...s,
+      assignments,
+      lastSettlement: maxSettlement > 0 ? maxSettlement : s.lastSettlement,
+    };
+  });
+}
+
 app.get("/api/staff", async (c) => {
   const auth = c.get("auth");
   const staff = await db.listStaff(c.env.DB);
-  return c.json(staff.map((s) => publicStaff(s, auth)));
+  const orders = await db.listOrders(c.env.DB);
+  const reconciled = reconcileStaffAssignmentsWithOrders(staff, orders);
+  return c.json(reconciled.map((s) => publicStaff(s, auth)));
 });
 
 app.get("/api/staff/:id", async (c) => {
   const auth = c.get("auth");
   const staff = await db.getStaff(c.env.DB, c.req.param("id"));
   if (!staff) return c.json({ error: "Not found." }, 404);
-  return c.json(publicStaff(staff, auth));
+  const orders = await db.listOrders(c.env.DB);
+  const [reconciled] = reconcileStaffAssignmentsWithOrders([staff], orders);
+  return c.json(publicStaff(reconciled, auth));
 });
 
 app.post("/api/staff", async (c) => {
@@ -645,21 +692,27 @@ app.post("/api/staff/:staffId/settlements", async (c) => {
   if (!staff) return c.json({ error: "Staff member not found." }, 404);
 
   const existingMax = Math.max(
-    staff.lastSettlement || 1,
+    staff.lastSettlement || 0,
     ...(staff.assignments || []).map((a) => a.settlementNumber || 0)
   );
 
   const targetNumber =
     body.settlementNumber && Number(body.settlementNumber) > 0
       ? Number(body.settlementNumber)
-      : existingMax + 1;
+      : (existingMax === 0 ? 1 : existingMax + 1);
 
   const targetOrderIds =
     Array.isArray(body.orderIds) && body.orderIds.length > 0 ? new Set(body.orderIds) : null;
+  const targetBorrowIds =
+    Array.isArray((body as { borrowIds?: string[] }).borrowIds) && (body as { borrowIds?: string[] }).borrowIds!.length > 0
+      ? new Set((body as { borrowIds?: string[] }).borrowIds)
+      : null;
 
   const today = new Date().toISOString().slice(0, 10);
 
   const orders = await db.listOrders(c.env.DB);
+  const settledOrderIds = new Set<string>();
+
   for (const o of orders) {
     if (!o.staffAssigned) continue;
     let orderChanged = false;
@@ -671,6 +724,7 @@ app.post("/api/staff/:staffId/settlements", async (c) => {
 
       if (isTarget) {
         orderChanged = true;
+        settledOrderIds.add(o.id);
         return {
           ...a,
           paymentStatus: "paid" as const,
@@ -682,454 +736,657 @@ app.post("/api/staff/:staffId/settlements", async (c) => {
     });
 
     if (orderChanged) {
-      const updatedOrder = await db.updateOrder(c.env.DB, o.id, { staffAssigned: updatedStaffAssigned });
-      if (updatedOrder) {
-        await db.syncStaffAssignmentsForOrder(c.env.DB, updatedOrder);
-      }
+      await db.updateOrder(c.env.DB, o.id, { staffAssigned: updatedStaffAssigned });
     }
   }
 
-  await db.updateStaffLastSettlement(c.env.DB, staffId, Math.max(targetNumber, staff.lastSettlement || 1));
+  // Update staff assignments directly and atomically
+  const updatedAssignments = (staff.assignments || []).map((a) => {
+    const isTarget = targetOrderIds
+      ? targetOrderIds.has(a.orderId)
+      : settledOrderIds.has(a.orderId);
 
-  const refreshedStaff = await db.getStaff(c.env.DB, staffId);
-  if (!refreshedStaff) return c.json({ error: "Staff not found." }, 404);
-  const { pin: _pin, ...rest } = refreshedStaff;
+    if (isTarget) {
+      return {
+        ...a,
+        paymentStatus: "paid" as const,
+        settlementNumber: targetNumber,
+        settledAt: a.settledAt || today,
+      };
+    }
+    return a;
+  });
+
+  const nextLastSettlement = Math.max(
+    targetNumber,
+    staff.lastSettlement || 0,
+    ...updatedAssignments.map((a) => a.settlementNumber || 0)
+  );
+
+  const updatedBorrows = (staff.borrows ?? []).map((b) => {
+    if (targetBorrowIds && targetBorrowIds.has(b.id)) {
+      return {
+        ...b,
+        paymentStatus: "settled" as StaffBorrowStatus,
+        settlementNumber: targetNumber,
+        settledAt: b.settledAt || today,
+      };
+    }
+    return b;
+  });
+
+  const mergedStaff: StaffMember = {
+    ...staff,
+    assignments: updatedAssignments,
+    borrows: updatedBorrows,
+    lastSettlement: Math.max(
+      nextLastSettlement,
+      ...updatedBorrows.map((b) => b.settlementNumber || 0)
+    ),
+  };
+
+  await c.env.DB.prepare("UPDATE staff SET data = ? WHERE id = ?")
+    .bind(JSON.stringify(mergedStaff), staffId)
+    .run();
+
+  const { pin: _pin, ...rest } = mergedStaff;
+  return c.json(rest);
+});
+
+// Owner-only: revert a settlement batch, moving its assignments back to active.
+app.delete("/api/staff/:staffId/settlements/:settlementNumber", async (c) => {
+  const auth = c.get("auth");
+  if (auth.role !== "owner") {
+    return c.json({ error: "Only the owner can revert settlements." }, 403);
+  }
+
+  const staffId = c.req.param("staffId");
+  const targetNumber = Number(c.req.param("settlementNumber"));
+  if (!targetNumber) return c.json({ error: "Invalid settlement number." }, 400);
+
+  const staff = await db.getStaff(c.env.DB, staffId);
+  if (!staff) return c.json({ error: "Staff not found." }, 404);
+
+  const orders = await db.listOrders(c.env.DB);
+  const revertedOrderIds = new Set<string>();
+
+  for (const o of orders) {
+    if (!o.staffAssigned) continue;
+    let orderChanged = false;
+    const updatedStaffAssigned = o.staffAssigned.map((a) => {
+      if (a.staffId === staffId && Number(a.settlementNumber) === targetNumber) {
+        orderChanged = true;
+        revertedOrderIds.add(o.id);
+        const copy = { ...a };
+        delete copy.settlementNumber;
+        delete copy.settledAt;
+        return copy;
+      }
+      return a;
+    });
+
+    if (orderChanged) {
+      await db.updateOrder(c.env.DB, o.id, { staffAssigned: updatedStaffAssigned });
+    }
+  }
+
+  const updatedAssignments = (staff.assignments || []).map((a) => {
+    if (Number(a.settlementNumber) === targetNumber || revertedOrderIds.has(a.orderId)) {
+      const copy = { ...a };
+      delete copy.settlementNumber;
+      delete copy.settledAt;
+      return copy;
+    }
+    return a;
+  });
+
+  const remainingMax = Math.max(
+    0,
+    ...updatedAssignments.map((a) => a.settlementNumber || 0)
+  );
+
+  const updatedBorrows = (staff.borrows ?? []).map((b) => {
+    if (Number(b.settlementNumber) === targetNumber) {
+      const copy = { ...b, paymentStatus: "due" as StaffBorrowStatus };
+      delete copy.settlementNumber;
+      delete copy.settledAt;
+      return copy;
+    }
+    return b;
+  });
+
+  const remainingMaxWithBorrows = Math.max(
+    0,
+    ...updatedAssignments.map((a) => a.settlementNumber || 0),
+    ...updatedBorrows.map((b) => b.settlementNumber || 0)
+  );
+
+  const mergedStaff: StaffMember = {
+    ...staff,
+    assignments: updatedAssignments,
+    borrows: updatedBorrows,
+    lastSettlement: remainingMaxWithBorrows,
+  };
+
+  await c.env.DB.prepare("UPDATE staff SET data = ? WHERE id = ?")
+    .bind(JSON.stringify(mergedStaff), staffId)
+    .run();
+
+  const { pin: _pin, ...rest } = mergedStaff;
   return c.json(rest);
 });
 
 // ---------------- staff borrows ----------------
-// Money a staff member borrowed from the owner (with a reason and a date).
-// It belongs to the staff member, not to one order: it is deducted from the
-// total of ALL their assigned orders — remaining = total of assignments - borrows.
-// The ledger lives on the staff record (`borrows[]`), so reading it needs no
-// extra endpoint: GET /api/staff and GET /api/staff/:id already include it.
-// A borrow can exceed what has been earned so far (staff often borrow before
-// the work is done), so the amount is deliberately NOT capped by the total.
+  // Money a staff member borrowed from the owner (with a reason and a date).
+  // It belongs to the staff member, not to one order: it is deducted from the
+  // total of ALL their assigned orders — remaining = total of assignments - borrows.
+  // The ledger lives on the staff record (`borrows[]`), so reading it needs no
+  // extra endpoint: GET /api/staff and GET /api/staff/:id already include it.
+  // A borrow can exceed what has been earned so far (staff often borrow before
+  // the work is done), so the amount is deliberately NOT capped by the total.
 
-// Owner-only: record a borrow.
-app.post("/api/staff/:staffId/borrows", async (c) => {
-  const auth = c.get("auth");
-  if (auth.role !== "owner") {
-    return c.json({ error: "Only the owner can record borrows." }, 403);
-  }
+  // Owner-only: record a borrow.
+  app.post("/api/staff/:staffId/borrows", async (c) => {
+    const auth = c.get("auth");
+    if (auth.role !== "owner") {
+      return c.json({ error: "Only the owner can record borrows." }, 403);
+    }
 
-  const staffId = c.req.param("staffId");
-  const body = (await c.req.json().catch(() => ({}))) as {
-    amount?: unknown;
-    date?: unknown;
-    reason?: unknown;
-  };
+    const staffId = c.req.param("staffId");
+    const body = (await c.req.json().catch(() => ({}))) as {
+      amount?: unknown;
+      date?: unknown;
+      reason?: unknown;
+      paymentStatus?: unknown;
+      settlementNumber?: unknown;
+      settledAt?: unknown;
+    };
 
-  const staff = await db.getStaff(c.env.DB, staffId);
-  if (!staff) return c.json({ error: "Staff not found." }, 404);
+    const staff = await db.getStaff(c.env.DB, staffId);
+    if (!staff) return c.json({ error: "Staff not found." }, 404);
 
-  const amount = toAmount(body.amount);
-  if (!(amount > 0)) return c.json({ error: "Enter an amount greater than 0." }, 400);
+    const amount = toAmount(body.amount);
+    if (!(amount > 0)) return c.json({ error: "Enter an amount greater than 0." }, 400);
 
-  const reason = cleanReason(body.reason);
-  if (!reason) return c.json({ error: "Enter a reason for the borrow." }, 400);
+    const reason = cleanReason(body.reason);
+    if (!reason) return c.json({ error: "Enter a reason for the borrow." }, 400);
 
-  const borrow: StaffBorrow = {
-    id: crypto.randomUUID(),
-    amount: money(amount),
-    date: cleanDate(body.date),
-    reason,
-    createdAt: new Date().toISOString(),
-  };
+    const rawStatus = String(body.paymentStatus || "").toLowerCase();
+    const paymentStatus: StaffBorrowStatus =
+      rawStatus === "paid" ? "paid" : rawStatus === "settled" ? "settled" : "due";
 
-  const updated = await db.updateStaffBorrows(c.env.DB, staffId, [...(staff.borrows ?? []), borrow]);
-  if (!updated) return c.json({ error: "Staff not found." }, 404);
-  const { pin: _pin, ...rest } = updated;
-  return c.json(rest, 201);
-});
+    const borrow: StaffBorrow = {
+      id: crypto.randomUUID(),
+      amount: money(amount),
+      date: cleanDate(body.date),
+      reason,
+      paymentStatus,
+      createdAt: new Date().toISOString(),
+    };
 
-// Owner-only: remove a wrongly recorded borrow (or one that was paid back).
-app.delete("/api/staff/:staffId/borrows/:borrowId", async (c) => {
-  const auth = c.get("auth");
-  if (auth.role !== "owner") {
-    return c.json({ error: "Only the owner can delete borrows." }, 403);
-  }
+    if (paymentStatus === "settled") {
+      const num = Number(body.settlementNumber);
+      borrow.settlementNumber = num > 0 ? num : (staff.lastSettlement ? staff.lastSettlement + 1 : 1);
+      borrow.settledAt = cleanDate(body.settledAt) || new Date().toISOString().slice(0, 10);
+    }
 
-  const staffId = c.req.param("staffId");
-  const borrowId = c.req.param("borrowId");
+    const updatedBorrows = [...(staff.borrows ?? []), borrow];
+    const newLast = paymentStatus === "settled" && borrow.settlementNumber
+      ? Math.max(staff.lastSettlement || 0, borrow.settlementNumber)
+      : staff.lastSettlement;
 
-  const staff = await db.getStaff(c.env.DB, staffId);
-  if (!staff) return c.json({ error: "Staff not found." }, 404);
+    const merged: StaffMember = { ...staff, borrows: updatedBorrows, lastSettlement: newLast };
+    await c.env.DB.prepare("UPDATE staff SET data = ? WHERE id = ?").bind(JSON.stringify(merged), staffId).run();
 
-  const before = staff.borrows ?? [];
-  const after = before.filter((b) => b.id !== borrowId);
-  if (after.length === before.length) return c.json({ error: "Borrow not found." }, 404);
+    const { pin: _pin, ...rest } = merged;
+    return c.json(rest, 201);
+  });
 
-  const updated = await db.updateStaffBorrows(c.env.DB, staffId, after);
-  if (!updated) return c.json({ error: "Staff not found." }, 404);
-  const { pin: _pin, ...rest } = updated;
-  return c.json(rest);
-});
+  // Owner-only: update a borrow (amount, date, reason, paymentStatus, settlementNumber).
+  app.put("/api/staff/:staffId/borrows/:borrowId", async (c) => {
+    const auth = c.get("auth");
+    if (auth.role !== "owner") {
+      return c.json({ error: "Only the owner can edit borrows." }, 403);
+    }
 
-app.put("/api/staff/:id", async (c) => {
-  const auth = c.get("auth");
-  const id = c.req.param("id");
-  // Owner can edit anyone. A staff member may only edit their own profile.
-  if (auth.role !== "owner" && auth.staffId !== id) {
-    return c.json({ error: "You can only edit your own profile." }, 403);
-  }
-  const body = (await c.req.json().catch(() => ({}))) as Partial<StaffMember>;
-  const patch: { name?: string; phone?: string; pin?: string } = {};
-  if (typeof body.name === "string") patch.name = body.name;
-  if (typeof body.phone === "string") patch.phone = body.phone;
-  if (typeof body.pin === "string") patch.pin = body.pin;
-  const updated = await db.updateStaffProfile(c.env.DB, id, patch);
-  if (!updated) return c.json({ error: "Not found." }, 404);
-  const { pin: _pin, ...rest } = updated;
-  return c.json(rest);
-});
+    const staffId = c.req.param("staffId");
+    const borrowId = c.req.param("borrowId");
+    const body = (await c.req.json().catch(() => ({}))) as Partial<StaffBorrow>;
 
+    const staff = await db.getStaff(c.env.DB, staffId);
+    if (!staff) return c.json({ error: "Staff not found." }, 404);
 
-// ---------------- auto rides (Anjaneya auto rentals VKM) ----------------
+    let found = false;
+    const updatedBorrows = (staff.borrows ?? []).map((b) => {
+      if (b.id !== borrowId) return b;
+      found = true;
+      const copy: StaffBorrow = { ...b };
+      if (body.amount !== undefined) copy.amount = money(toAmount(body.amount));
+      if (body.date !== undefined) copy.date = cleanDate(body.date);
+      if (body.reason !== undefined) copy.reason = cleanReason(body.reason);
+      if (body.paymentStatus !== undefined) {
+        const raw = String(body.paymentStatus).toLowerCase();
+        copy.paymentStatus = (raw === "paid" ? "paid" : raw === "settled" ? "settled" : "due") as StaffBorrowStatus;
+        if (copy.paymentStatus === "settled") {
+          const num = Number(body.settlementNumber);
+          copy.settlementNumber = num > 0 ? num : (copy.settlementNumber || (staff.lastSettlement ? staff.lastSettlement + 1 : 1));
+          copy.settledAt = cleanDate(body.settledAt) || copy.settledAt || new Date().toISOString().slice(0, 10);
+        } else {
+          delete copy.settlementNumber;
+          delete copy.settledAt;
+        }
+      }
+      return copy;
+    });
 
-function redactRideForDriver(ride: AutoRide): AutoRide {
-  return {
-    ...ride,
-    totalAmount: "",
-    advancePaid: "",
-    dueAmount: "",
-  };
-}
+    if (!found) return c.json({ error: "Borrow not found." }, 404);
 
-app.get("/api/auto-rides", async (c) => {
-  const auth = c.get("auth");
-  const rides = await db.listAutoRides(c.env.DB);
-  if (auth.role === "driver" || auth.role === "staff") {
-    const driverName = (auth.userName || "").trim().toLowerCase();
-    const myRides = rides.filter(
-      (r) => !driverName || (r.driverAssigned || "").trim().toLowerCase() === driverName
+    const newLast = Math.max(
+      staff.lastSettlement || 0,
+      ...updatedBorrows.map((b) => b.settlementNumber || 0)
     );
-    // Return matching rides or all rides redacted if unassigned
-    const listToReturn = myRides.length > 0 ? myRides : rides;
-    return c.json(listToReturn.map(redactRideForDriver));
-  }
-  return c.json(rides);
-});
 
-app.get("/api/auto-rides/:id", async (c) => {
-  const auth = c.get("auth");
-  const id = c.req.param("id");
-  const ride = await db.getAutoRide(c.env.DB, id);
-  if (!ride) return c.json({ error: "Ride not found." }, 404);
+    const merged: StaffMember = { ...staff, borrows: updatedBorrows, lastSettlement: newLast };
+    await c.env.DB.prepare("UPDATE staff SET data = ? WHERE id = ?").bind(JSON.stringify(merged), staffId).run();
 
-  if (auth.role === "driver" || auth.role === "staff") {
-    return c.json(redactRideForDriver(ride));
-  }
-  return c.json(ride);
-});
+    const { pin: _pin, ...rest } = merged;
+    return c.json(rest);
+  });
 
-app.post("/api/auto-rides", async (c) => {
-  const auth = c.get("auth");
-  const body = (await c.req.json().catch(() => ({}))) as Partial<AutoRide>;
-  if (!body.customerName?.toString().trim()) {
-    return c.json({ error: "Customer name is required." }, 400);
-  }
-  if (auth.role === "owner") {
-    if (!body.totalAmount?.toString().trim() || Number.isNaN(parseFloat(String(body.totalAmount)))) {
-      return c.json({ error: "A valid total amount is required." }, 400);
+  // Owner-only: remove a wrongly recorded borrow (or one that was paid back).
+  app.delete("/api/staff/:staffId/borrows/:borrowId", async (c) => {
+    const auth = c.get("auth");
+    if (auth.role !== "owner") {
+      return c.json({ error: "Only the owner can delete borrows." }, 403);
     }
-  }
 
-  const total = parseFloat(String(body.totalAmount || "0")) || 0;
-  const advance = parseFloat(String(body.advancePaid || "0")) || 0;
-  const due = Math.max(total - advance, 0);
+    const staffId = c.req.param("staffId");
+    const borrowId = c.req.param("borrowId");
 
-  const assignedDriver = (body.driverAssigned || ((auth.role === "driver" || auth.role === "staff") && auth.userName ? auth.userName : "Unassigned")).toString().trim();
+    const staff = await db.getStaff(c.env.DB, staffId);
+    if (!staff) return c.json({ error: "Staff not found." }, 404);
 
-  let rideId = body.id?.trim();
-  if (!rideId || rideId.startsWith("AR-")) {
-    const maxSeq = await db.maxAutoRideSeq(c.env.DB);
-    const { id } = nextRideId(maxSeq);
-    rideId = id;
-  }
+    const before = staff.borrows ?? [];
+    const after = before.filter((b) => b.id !== borrowId);
+    if (after.length === before.length) return c.json({ error: "Borrow not found." }, 404);
 
-  const ride: AutoRide = {
-    id: rideId,
-    customerName: body.customerName.toString().trim(),
-    customerPhone: (body.customerPhone || "").toString().trim(),
-    driverAssigned: assignedDriver,
-    pickupLocation: (body.pickupLocation || "").toString().trim(),
-    dropLocation: (body.dropLocation || "").toString().trim(),
-    date: body.date?.toString().trim() || new Date().toISOString().slice(0, 10),
-    totalAmount: auth.role === "owner" ? String(total) : "0",
-    advancePaid: auth.role === "owner" ? String(advance) : "0",
-    dueAmount: auth.role === "owner" ? String(due) : "0",
-    driverPay: auth.role === "owner" ? String(parseFloat(String(body.driverPay || "0")) || 0) : "0",
-    status: body.status || "completed",
-    paymentStatus: auth.role === "owner" ? (body.paymentStatus || (due === 0 && total > 0 ? "paid" : "due")) : "due",
-    notes: (body.notes || "").toString().trim(),
-    createdAt: new Date().toISOString(),
-  };
+    const remainingMax = Math.max(
+      0,
+      ...(staff.assignments || []).map((a) => a.settlementNumber || 0),
+      ...after.map((b) => b.settlementNumber || 0)
+    );
 
-  await db.insertAutoRide(c.env.DB, ride);
-  return c.json(ride, 201);
-});
+    const merged: StaffMember = { ...staff, borrows: after, lastSettlement: remainingMax };
+    await c.env.DB.prepare("UPDATE staff SET data = ? WHERE id = ?").bind(JSON.stringify(merged), staffId).run();
 
-app.put("/api/auto-rides/:id", async (c) => {
-  const auth = c.get("auth");
-  const id = c.req.param("id");
-  const body = (await c.req.json().catch(() => ({}))) as Partial<AutoRide>;
+    const { pin: _pin, ...rest } = merged;
+    return c.json(rest);
+  });
 
-  if (auth.role === "driver" || auth.role === "staff") {
-    const existing = await db.getAutoRide(c.env.DB, id);
-    if (!existing) return c.json({ error: "Ride not found." }, 404);
-    if ((existing.driverAssigned || "").trim().toLowerCase() !== (auth.userName || "").trim().toLowerCase()) {
-      return c.json({ error: "You can only update your own assigned rides." }, 403);
+  app.put("/api/staff/:id", async (c) => {
+    const auth = c.get("auth");
+    const id = c.req.param("id");
+    // Owner can edit anyone. A staff member may only edit their own profile.
+    if (auth.role !== "owner" && auth.staffId !== id) {
+      return c.json({ error: "You can only edit your own profile." }, 403);
     }
+    const body = (await c.req.json().catch(() => ({}))) as Partial<StaffMember>;
+    const patch: { name?: string; phone?: string; pin?: string } = {};
+    if (typeof body.name === "string") patch.name = body.name;
+    if (typeof body.phone === "string") patch.phone = body.phone;
+    if (typeof body.pin === "string") patch.pin = body.pin;
+    const updated = await db.updateStaffProfile(c.env.DB, id, patch);
+    if (!updated) return c.json({ error: "Not found." }, 404);
+    const { pin: _pin, ...rest } = updated;
+    return c.json(rest);
+  });
+
+
+  // ---------------- auto rides (Anjaneya auto rentals VKM) ----------------
+
+  function redactRideForDriver(ride: AutoRide): AutoRide {
+    return {
+      ...ride,
+      totalAmount: "",
+      advancePaid: "",
+      dueAmount: "",
+    };
+  }
+
+  app.get("/api/auto-rides", async (c) => {
+    const auth = c.get("auth");
+    const rides = await db.listAutoRides(c.env.DB);
+    if (auth.role === "driver" || auth.role === "staff") {
+      const driverName = (auth.userName || "").trim().toLowerCase();
+      const myRides = rides.filter(
+        (r) => !driverName || (r.driverAssigned || "").trim().toLowerCase() === driverName
+      );
+      // Return matching rides or all rides redacted if unassigned
+      const listToReturn = myRides.length > 0 ? myRides : rides;
+      return c.json(listToReturn.map(redactRideForDriver));
+    }
+    return c.json(rides);
+  });
+
+  app.get("/api/auto-rides/:id", async (c) => {
+    const auth = c.get("auth");
+    const id = c.req.param("id");
+    const ride = await db.getAutoRide(c.env.DB, id);
+    if (!ride) return c.json({ error: "Ride not found." }, 404);
+
+    if (auth.role === "driver" || auth.role === "staff") {
+      return c.json(redactRideForDriver(ride));
+    }
+    return c.json(ride);
+  });
+
+  app.post("/api/auto-rides", async (c) => {
+    const auth = c.get("auth");
+    const body = (await c.req.json().catch(() => ({}))) as Partial<AutoRide>;
+    if (!body.customerName?.toString().trim()) {
+      return c.json({ error: "Customer name is required." }, 400);
+    }
+    if (auth.role === "owner") {
+      if (!body.totalAmount?.toString().trim() || Number.isNaN(parseFloat(String(body.totalAmount)))) {
+        return c.json({ error: "A valid total amount is required." }, 400);
+      }
+    }
+
+    const total = parseFloat(String(body.totalAmount || "0")) || 0;
+    const advance = parseFloat(String(body.advancePaid || "0")) || 0;
+    const due = Math.max(total - advance, 0);
+
+    const assignedDriver = (body.driverAssigned || ((auth.role === "driver" || auth.role === "staff") && auth.userName ? auth.userName : "Unassigned")).toString().trim();
+
+    let rideId = body.id?.trim();
+    if (!rideId || rideId.startsWith("AR-")) {
+      const maxSeq = await db.maxAutoRideSeq(c.env.DB);
+      const { id } = nextRideId(maxSeq);
+      rideId = id;
+    }
+
+    const ride: AutoRide = {
+      id: rideId,
+      customerName: body.customerName.toString().trim(),
+      customerPhone: (body.customerPhone || "").toString().trim(),
+      driverAssigned: assignedDriver,
+      pickupLocation: (body.pickupLocation || "").toString().trim(),
+      dropLocation: (body.dropLocation || "").toString().trim(),
+      date: body.date?.toString().trim() || new Date().toISOString().slice(0, 10),
+      totalAmount: auth.role === "owner" ? String(total) : "0",
+      advancePaid: auth.role === "owner" ? String(advance) : "0",
+      dueAmount: auth.role === "owner" ? String(due) : "0",
+      driverPay: auth.role === "owner" ? String(parseFloat(String(body.driverPay || "0")) || 0) : "0",
+      status: body.status || "completed",
+      paymentStatus: auth.role === "owner" ? (body.paymentStatus || (due === 0 && total > 0 ? "paid" : "due")) : "due",
+      notes: (body.notes || "").toString().trim(),
+      createdAt: new Date().toISOString(),
+    };
+
+    await db.insertAutoRide(c.env.DB, ride);
+    return c.json(ride, 201);
+  });
+
+  app.put("/api/auto-rides/:id", async (c) => {
+    const auth = c.get("auth");
+    const id = c.req.param("id");
+    const body = (await c.req.json().catch(() => ({}))) as Partial<AutoRide>;
+
+    if (auth.role === "driver" || auth.role === "staff") {
+      const existing = await db.getAutoRide(c.env.DB, id);
+      if (!existing) return c.json({ error: "Ride not found." }, 404);
+      if ((existing.driverAssigned || "").trim().toLowerCase() !== (auth.userName || "").trim().toLowerCase()) {
+        return c.json({ error: "You can only update your own assigned rides." }, 403);
+      }
+      const patch: Partial<AutoRide> = {};
+      if (body.status !== undefined) patch.status = body.status;
+      const updated = await db.updateAutoRide(c.env.DB, id, patch);
+      return c.json(updated ? redactRideForDriver(updated) : null);
+    }
+
     const patch: Partial<AutoRide> = {};
+    if (typeof body.customerName === "string") patch.customerName = body.customerName.trim();
+    if (typeof body.customerPhone === "string") patch.customerPhone = body.customerPhone.trim();
+    if (typeof body.driverAssigned === "string") patch.driverAssigned = body.driverAssigned.trim();
+    if (typeof body.pickupLocation === "string") patch.pickupLocation = body.pickupLocation.trim();
+    if (typeof body.dropLocation === "string") patch.dropLocation = body.dropLocation.trim();
+    if (typeof body.date === "string") patch.date = body.date.trim();
+    if (body.totalAmount !== undefined) patch.totalAmount = String(body.totalAmount).trim();
+    if (body.advancePaid !== undefined) patch.advancePaid = String(body.advancePaid).trim();
+    if (body.dueAmount !== undefined) patch.dueAmount = String(body.dueAmount).trim();
+    if (body.driverPay !== undefined) patch.driverPay = String(body.driverPay).trim();
     if (body.status !== undefined) patch.status = body.status;
+    if (body.paymentStatus !== undefined) patch.paymentStatus = body.paymentStatus;
+    if (typeof body.notes === "string") patch.notes = body.notes.trim();
+
     const updated = await db.updateAutoRide(c.env.DB, id, patch);
-    return c.json(updated ? redactRideForDriver(updated) : null);
-  }
+    if (!updated) return c.json({ error: "Not found." }, 404);
+    return c.json(updated);
+  });
 
-  const patch: Partial<AutoRide> = {};
-  if (typeof body.customerName === "string") patch.customerName = body.customerName.trim();
-  if (typeof body.customerPhone === "string") patch.customerPhone = body.customerPhone.trim();
-  if (typeof body.driverAssigned === "string") patch.driverAssigned = body.driverAssigned.trim();
-  if (typeof body.pickupLocation === "string") patch.pickupLocation = body.pickupLocation.trim();
-  if (typeof body.dropLocation === "string") patch.dropLocation = body.dropLocation.trim();
-  if (typeof body.date === "string") patch.date = body.date.trim();
-  if (body.totalAmount !== undefined) patch.totalAmount = String(body.totalAmount).trim();
-  if (body.advancePaid !== undefined) patch.advancePaid = String(body.advancePaid).trim();
-  if (body.dueAmount !== undefined) patch.dueAmount = String(body.dueAmount).trim();
-  if (body.driverPay !== undefined) patch.driverPay = String(body.driverPay).trim();
-  if (body.status !== undefined) patch.status = body.status;
-  if (body.paymentStatus !== undefined) patch.paymentStatus = body.paymentStatus;
-  if (typeof body.notes === "string") patch.notes = body.notes.trim();
+  app.delete("/api/auto-rides/:id", async (c) => {
+    const auth = c.get("auth");
+    if (auth.role !== "owner") {
+      return c.json({ error: "Only the owner can delete rides." }, 403);
+    }
+    const ok = await db.deleteAutoRide(c.env.DB, c.req.param("id"));
+    if (!ok) return c.json({ error: "Not found." }, 404);
+    return c.json({ success: true });
+  });
 
-  const updated = await db.updateAutoRide(c.env.DB, id, patch);
-  if (!updated) return c.json({ error: "Not found." }, 404);
-  return c.json(updated);
-});
+  // ---------------- auto diesel and repair (investments) ----------------
 
-app.delete("/api/auto-rides/:id", async (c) => {
-  const auth = c.get("auth");
-  if (auth.role !== "owner") {
-    return c.json({ error: "Only the owner can delete rides." }, 403);
-  }
-  const ok = await db.deleteAutoRide(c.env.DB, c.req.param("id"));
-  if (!ok) return c.json({ error: "Not found." }, 404);
-  return c.json({ success: true });
-});
+  app.get("/api/auto-diesel", async (c) => {
+    const auth = c.get("auth");
+    if (auth.role !== "owner") {
+      return c.json({ error: "Only the owner can view diesel and repair expenses." }, 403);
+    }
+    const entries = await db.listAutoDiesel(c.env.DB);
+    return c.json(entries);
+  });
 
-// ---------------- auto diesel and repair (investments) ----------------
+  app.post("/api/auto-diesel", async (c) => {
+    const auth = c.get("auth");
+    if (auth.role !== "owner") {
+      return c.json({ error: "Only the owner can log diesel or repair expenses." }, 403);
+    }
+    const body = (await c.req.json().catch(() => ({}))) as Partial<AutoDieselEntry>;
+    if (!body.totalAmount?.toString().trim() || Number.isNaN(parseFloat(String(body.totalAmount)))) {
+      return c.json({ error: "A valid amount is required." }, 400);
+    }
 
-app.get("/api/auto-diesel", async (c) => {
-  const auth = c.get("auth");
-  if (auth.role !== "owner") {
-    return c.json({ error: "Only the owner can view diesel and repair expenses." }, 403);
-  }
-  const entries = await db.listAutoDiesel(c.env.DB);
-  return c.json(entries);
-});
+    const isRepair = body.type === "repair";
+    const prefix = isRepair ? "REP" : "DL";
+    const entry: AutoDieselEntry = {
+      id: body.id?.trim() || `${prefix}-${String(Date.now()).slice(-4)}`,
+      date: body.date?.toString().trim() || new Date().toISOString().slice(0, 10),
+      type: isRepair ? "repair" : "diesel",
+      totalAmount: String(body.totalAmount).trim(),
+      litres: (body.litres || "").toString().trim(),
+      filledByDriver: (body.filledByDriver || "").toString().trim(),
+      stationOrVehicle: (body.stationOrVehicle || "").toString().trim(),
+      repairItem: (body.repairItem || "").toString().trim(),
+      notes: (body.notes || "").toString().trim(),
+      createdAt: new Date().toISOString(),
+    };
 
-app.post("/api/auto-diesel", async (c) => {
-  const auth = c.get("auth");
-  if (auth.role !== "owner") {
-    return c.json({ error: "Only the owner can log diesel or repair expenses." }, 403);
-  }
-  const body = (await c.req.json().catch(() => ({}))) as Partial<AutoDieselEntry>;
-  if (!body.totalAmount?.toString().trim() || Number.isNaN(parseFloat(String(body.totalAmount)))) {
-    return c.json({ error: "A valid amount is required." }, 400);
-  }
+    await db.insertAutoDiesel(c.env.DB, entry);
+    return c.json(entry, 201);
+  });
 
-  const isRepair = body.type === "repair";
-  const prefix = isRepair ? "REP" : "DL";
-  const entry: AutoDieselEntry = {
-    id: body.id?.trim() || `${prefix}-${String(Date.now()).slice(-4)}`,
-    date: body.date?.toString().trim() || new Date().toISOString().slice(0, 10),
-    type: isRepair ? "repair" : "diesel",
-    totalAmount: String(body.totalAmount).trim(),
-    litres: (body.litres || "").toString().trim(),
-    filledByDriver: (body.filledByDriver || "").toString().trim(),
-    stationOrVehicle: (body.stationOrVehicle || "").toString().trim(),
-    repairItem: (body.repairItem || "").toString().trim(),
-    notes: (body.notes || "").toString().trim(),
-    createdAt: new Date().toISOString(),
-  };
+  app.put("/api/auto-diesel/:id", async (c) => {
+    const auth = c.get("auth");
+    if (auth.role !== "owner") return c.json({ error: "Only the owner can edit expenses." }, 403);
+    const id = c.req.param("id");
+    const body = (await c.req.json().catch(() => ({}))) as Partial<AutoDieselEntry>;
+    const updated = await db.updateAutoDiesel(c.env.DB, id, body);
+    if (!updated) return c.json({ error: "Entry not found." }, 404);
+    return c.json(updated);
+  });
 
-  await db.insertAutoDiesel(c.env.DB, entry);
-  return c.json(entry, 201);
-});
+  app.delete("/api/auto-diesel/:id", async (c) => {
+    const auth = c.get("auth");
+    if (auth.role !== "owner") {
+      return c.json({ error: "Only the owner can delete diesel or repair entries." }, 403);
+    }
+    const ok = await db.deleteAutoDiesel(c.env.DB, c.req.param("id"));
+    if (!ok) return c.json({ error: "Not found." }, 404);
+    return c.json({ success: true });
+  });
 
-app.put("/api/auto-diesel/:id", async (c) => {
-  const auth = c.get("auth");
-  if (auth.role !== "owner") return c.json({ error: "Only the owner can edit expenses." }, 403);
-  const id = c.req.param("id");
-  const body = (await c.req.json().catch(() => ({}))) as Partial<AutoDieselEntry>;
-  const updated = await db.updateAutoDiesel(c.env.DB, id, body);
-  if (!updated) return c.json({ error: "Entry not found." }, 404);
-  return c.json(updated);
-});
+  // ---------------- auto driver payouts ----------------
 
-app.delete("/api/auto-diesel/:id", async (c) => {
-  const auth = c.get("auth");
-  if (auth.role !== "owner") {
-    return c.json({ error: "Only the owner can delete diesel or repair entries." }, 403);
-  }
-  const ok = await db.deleteAutoDiesel(c.env.DB, c.req.param("id"));
-  if (!ok) return c.json({ error: "Not found." }, 404);
-  return c.json({ success: true });
-});
+  app.get("/api/auto-payouts", async (c) => {
+    const auth = c.get("auth");
+    const payouts = await db.listAutoDriverPayouts(c.env.DB);
+    if (auth.role === "driver" || auth.role === "staff") {
+      const driverName = (auth.userName || "").trim().toLowerCase();
+      return c.json(payouts.filter((p) => (p.driverName || "").trim().toLowerCase() === driverName));
+    }
+    return c.json(payouts);
+  });
 
-// ---------------- auto driver payouts ----------------
+  app.post("/api/auto-payouts", async (c) => {
+    const auth = c.get("auth");
+    if (auth.role !== "owner") return c.json({ error: "Only the owner can record payouts." }, 403);
+    const body = (await c.req.json().catch(() => ({}))) as Partial<AutoDriverPayout>;
+    if (!body.driverName?.toString().trim()) {
+      return c.json({ error: "Driver name is required." }, 400);
+    }
+    if (!body.amount?.toString().trim() || Number.isNaN(parseFloat(String(body.amount)))) {
+      return c.json({ error: "A valid amount is required." }, 400);
+    }
 
-app.get("/api/auto-payouts", async (c) => {
-  const auth = c.get("auth");
-  const payouts = await db.listAutoDriverPayouts(c.env.DB);
-  if (auth.role === "driver" || auth.role === "staff") {
-    const driverName = (auth.userName || "").trim().toLowerCase();
-    return c.json(payouts.filter((p) => (p.driverName || "").trim().toLowerCase() === driverName));
-  }
-  return c.json(payouts);
-});
+    const payout: AutoDriverPayout = {
+      id: body.id?.trim() || `PAY-${String(Date.now()).slice(-4)}`,
+      driverName: body.driverName.toString().trim(),
+      amount: String(body.amount).trim(),
+      date: body.date?.toString().trim() || new Date().toISOString().slice(0, 10),
+      mode: (body.mode || "Cash").toString().trim(),
+      note: (body.note || "").toString().trim(),
+      createdAt: new Date().toISOString(),
+    };
 
-app.post("/api/auto-payouts", async (c) => {
-  const auth = c.get("auth");
-  if (auth.role !== "owner") return c.json({ error: "Only the owner can record payouts." }, 403);
-  const body = (await c.req.json().catch(() => ({}))) as Partial<AutoDriverPayout>;
-  if (!body.driverName?.toString().trim()) {
-    return c.json({ error: "Driver name is required." }, 400);
-  }
-  if (!body.amount?.toString().trim() || Number.isNaN(parseFloat(String(body.amount)))) {
-    return c.json({ error: "A valid amount is required." }, 400);
-  }
+    await db.insertAutoDriverPayout(c.env.DB, payout);
+    return c.json(payout, 201);
+  });
 
-  const payout: AutoDriverPayout = {
-    id: body.id?.trim() || `PAY-${String(Date.now()).slice(-4)}`,
-    driverName: body.driverName.toString().trim(),
-    amount: String(body.amount).trim(),
-    date: body.date?.toString().trim() || new Date().toISOString().slice(0, 10),
-    mode: (body.mode || "Cash").toString().trim(),
-    note: (body.note || "").toString().trim(),
-    createdAt: new Date().toISOString(),
-  };
+  app.delete("/api/auto-payouts/:id", async (c) => {
+    const auth = c.get("auth");
+    if (auth.role !== "owner") return c.json({ error: "Only the owner can delete payouts." }, 403);
+    const ok = await db.deleteAutoDriverPayout(c.env.DB, c.req.param("id"));
+    if (!ok) return c.json({ error: "Not found." }, 404);
+    return c.json({ success: true });
+  });
 
-  await db.insertAutoDriverPayout(c.env.DB, payout);
-  return c.json(payout, 201);
-});
+  // ---------------- Auto Driver Borrows Endpoints ----------------
 
-app.delete("/api/auto-payouts/:id", async (c) => {
-  const auth = c.get("auth");
-  if (auth.role !== "owner") return c.json({ error: "Only the owner can delete payouts." }, 403);
-  const ok = await db.deleteAutoDriverPayout(c.env.DB, c.req.param("id"));
-  if (!ok) return c.json({ error: "Not found." }, 404);
-  return c.json({ success: true });
-});
+  app.get("/api/auto-borrows", async (c) => {
+    const auth = c.get("auth");
+    const borrows = await db.listAutoDriverBorrows(c.env.DB);
+    if (auth.role === "driver" || auth.role === "staff") {
+      const driverName = (auth.userName || "").trim().toLowerCase();
+      return c.json(borrows.filter((b) => (b.driverName || "").trim().toLowerCase() === driverName));
+    }
+    return c.json(borrows);
+  });
 
-// ---------------- Auto Driver Borrows Endpoints ----------------
+  app.post("/api/auto-borrows", async (c) => {
+    const auth = c.get("auth");
+    if (auth.role !== "owner") return c.json({ error: "Only the owner can record borrows." }, 403);
+    const body = (await c.req.json().catch(() => ({}))) as Partial<AutoDriverBorrow>;
+    if (!body.driverName || !body.amount) {
+      return c.json({ error: "driverName and amount are required" }, 400);
+    }
+    const borrow: AutoDriverBorrow = {
+      id: body.id || `BOR-${String(Date.now()).slice(-4)}`,
+      driverName: body.driverName.trim(),
+      amount: String(body.amount).trim(),
+      date: body.date || new Date().toISOString().slice(0, 10),
+      reason: body.reason || "",
+      paymentStatus: body.paymentStatus === "paid" ? "paid" : "due",
+      createdAt: new Date().toISOString(),
+    };
+    await db.insertAutoDriverBorrow(c.env.DB, borrow);
+    return c.json(borrow, 201);
+  });
 
-app.get("/api/auto-borrows", async (c) => {
-  const auth = c.get("auth");
-  const borrows = await db.listAutoDriverBorrows(c.env.DB);
-  if (auth.role === "driver" || auth.role === "staff") {
-    const driverName = (auth.userName || "").trim().toLowerCase();
-    return c.json(borrows.filter((b) => (b.driverName || "").trim().toLowerCase() === driverName));
-  }
-  return c.json(borrows);
-});
+  app.put("/api/auto-borrows/:id", async (c) => {
+    const auth = c.get("auth");
+    if (auth.role !== "owner") return c.json({ error: "Only the owner can edit borrows." }, 403);
+    const id = c.req.param("id");
+    const body = (await c.req.json().catch(() => ({}))) as Partial<AutoDriverBorrow>;
+    const updated = await db.updateAutoDriverBorrow(c.env.DB, id, body);
+    if (!updated) return c.json({ error: "Borrow record not found" }, 404);
+    return c.json(updated);
+  });
 
-app.post("/api/auto-borrows", async (c) => {
-  const auth = c.get("auth");
-  if (auth.role !== "owner") return c.json({ error: "Only the owner can record borrows." }, 403);
-  const body = (await c.req.json().catch(() => ({}))) as Partial<AutoDriverBorrow>;
-  if (!body.driverName || !body.amount) {
-    return c.json({ error: "driverName and amount are required" }, 400);
-  }
-  const borrow: AutoDriverBorrow = {
-    id: body.id || `BOR-${String(Date.now()).slice(-4)}`,
-    driverName: body.driverName.trim(),
-    amount: String(body.amount).trim(),
-    date: body.date || new Date().toISOString().slice(0, 10),
-    reason: body.reason || "",
-    paymentStatus: body.paymentStatus === "paid" ? "paid" : "due",
-    createdAt: new Date().toISOString(),
-  };
-  await db.insertAutoDriverBorrow(c.env.DB, borrow);
-  return c.json(borrow, 201);
-});
+  app.delete("/api/auto-borrows/:id", async (c) => {
+    const auth = c.get("auth");
+    if (auth.role !== "owner") return c.json({ error: "Only the owner can delete borrows." }, 403);
+    const id = c.req.param("id");
+    const deleted = await db.deleteAutoDriverBorrow(c.env.DB, id);
+    if (!deleted) return c.json({ error: "Borrow record not found" }, 404);
+    return c.json({ ok: true });
+  });
 
-app.put("/api/auto-borrows/:id", async (c) => {
-  const auth = c.get("auth");
-  if (auth.role !== "owner") return c.json({ error: "Only the owner can edit borrows." }, 403);
-  const id = c.req.param("id");
-  const body = (await c.req.json().catch(() => ({}))) as Partial<AutoDriverBorrow>;
-  const updated = await db.updateAutoDriverBorrow(c.env.DB, id, body);
-  if (!updated) return c.json({ error: "Borrow record not found" }, 404);
-  return c.json(updated);
-});
+  // ---------------- Auto Drivers Endpoints ----------------
 
-app.delete("/api/auto-borrows/:id", async (c) => {
-  const auth = c.get("auth");
-  if (auth.role !== "owner") return c.json({ error: "Only the owner can delete borrows." }, 403);
-  const id = c.req.param("id");
-  const deleted = await db.deleteAutoDriverBorrow(c.env.DB, id);
-  if (!deleted) return c.json({ error: "Borrow record not found" }, 404);
-  return c.json({ ok: true });
-});
+  app.get("/api/auto-drivers", async (c) => {
+    const auth = c.get("auth");
+    const drivers = await db.listAutoDrivers(c.env.DB);
+    const safeDrivers = drivers.map(({ pin: _pin, ...rest }) => rest);
+    return c.json(safeDrivers);
+  });
 
-// ---------------- Auto Drivers Endpoints ----------------
+  app.post("/api/auto-drivers", async (c) => {
+    const auth = c.get("auth");
+    if (auth.role !== "owner") return c.json({ error: "Only the owner can add drivers." }, 403);
+    const body = (await c.req.json().catch(() => ({}))) as Partial<AutoDriver>;
+    if (!body.name?.toString().trim()) {
+      return c.json({ error: "name is required" }, 400);
+    }
+    const driver: AutoDriver = {
+      id: body.id || "drv_" + Date.now(),
+      name: body.name.toString().trim(),
+      phone: (body.phone || "").toString().trim(),
+      pin: (body.pin || "").toString().trim(),
+      createdAt: new Date().toISOString(),
+    };
+    await db.insertAutoDriver(c.env.DB, driver);
+    const { pin: _pin, ...rest } = driver;
+    return c.json(rest, 201);
+  });
 
-app.get("/api/auto-drivers", async (c) => {
-  const auth = c.get("auth");
-  const drivers = await db.listAutoDrivers(c.env.DB);
-  const safeDrivers = drivers.map(({ pin: _pin, ...rest }) => rest);
-  return c.json(safeDrivers);
-});
+  app.put("/api/auto-drivers/:id", async (c) => {
+    const auth = c.get("auth");
+    const id = c.req.param("id");
+    if (auth.role !== "owner" && auth.driverId !== id) {
+      return c.json({ error: "Forbidden." }, 403);
+    }
+    const body = (await c.req.json().catch(() => ({}))) as Partial<AutoDriver>;
+    const patch: Partial<AutoDriver> = {};
+    if (typeof body.name === "string") patch.name = body.name.trim();
+    if (typeof body.phone === "string") patch.phone = body.phone.trim();
+    if (typeof body.pin === "string") patch.pin = body.pin.trim();
+    const updated = await db.updateAutoDriver(c.env.DB, id, patch);
+    if (!updated) return c.json({ error: "Driver record not found" }, 404);
+    const { pin: _pin, ...rest } = updated;
+    return c.json(rest);
+  });
 
-app.post("/api/auto-drivers", async (c) => {
-  const auth = c.get("auth");
-  if (auth.role !== "owner") return c.json({ error: "Only the owner can add drivers." }, 403);
-  const body = (await c.req.json().catch(() => ({}))) as Partial<AutoDriver>;
-  if (!body.name?.toString().trim()) {
-    return c.json({ error: "name is required" }, 400);
-  }
-  const driver: AutoDriver = {
-    id: body.id || "drv_" + Date.now(),
-    name: body.name.toString().trim(),
-    phone: (body.phone || "").toString().trim(),
-    pin: (body.pin || "").toString().trim(),
-    createdAt: new Date().toISOString(),
-  };
-  await db.insertAutoDriver(c.env.DB, driver);
-  const { pin: _pin, ...rest } = driver;
-  return c.json(rest, 201);
-});
+  app.delete("/api/auto-drivers/:id", async (c) => {
+    const auth = c.get("auth");
+    if (auth.role !== "owner") return c.json({ error: "Only the owner can delete drivers." }, 403);
+    const id = c.req.param("id");
+    const deleted = await db.deleteAutoDriver(c.env.DB, id);
+    if (!deleted) return c.json({ error: "Driver not found" }, 404);
+    return c.json({ ok: true });
+  });
 
-app.put("/api/auto-drivers/:id", async (c) => {
-  const auth = c.get("auth");
-  const id = c.req.param("id");
-  if (auth.role !== "owner" && auth.driverId !== id) {
-    return c.json({ error: "Forbidden." }, 403);
-  }
-  const body = (await c.req.json().catch(() => ({}))) as Partial<AutoDriver>;
-  const patch: Partial<AutoDriver> = {};
-  if (typeof body.name === "string") patch.name = body.name.trim();
-  if (typeof body.phone === "string") patch.phone = body.phone.trim();
-  if (typeof body.pin === "string") patch.pin = body.pin.trim();
-  const updated = await db.updateAutoDriver(c.env.DB, id, patch);
-  if (!updated) return c.json({ error: "Driver record not found" }, 404);
-  const { pin: _pin, ...rest } = updated;
-  return c.json(rest);
-});
+  app.onError((err, c) => {
+    console.error(err);
+    return c.json({ error: "Internal server error." }, 500);
+  });
 
-app.delete("/api/auto-drivers/:id", async (c) => {
-  const auth = c.get("auth");
-  if (auth.role !== "owner") return c.json({ error: "Only the owner can delete drivers." }, 403);
-  const id = c.req.param("id");
-  const deleted = await db.deleteAutoDriver(c.env.DB, id);
-  if (!deleted) return c.json({ error: "Driver not found" }, 404);
-  return c.json({ ok: true });
-});
-
-app.onError((err, c) => {
-  console.error(err);
-  return c.json({ error: "Internal server error." }, 500);
-});
-
-export default app;
+  export default app;

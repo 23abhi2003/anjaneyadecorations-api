@@ -86,6 +86,8 @@ export function withServerOwnedPayFields(incoming: StaffAssigned[], existing: St
       ...a,
       paymentStatus: coerceStatus(old?.paymentStatus),
       payments: old?.payments ?? [],
+      settlementNumber: old?.settlementNumber,
+      settledAt: old?.settledAt,
     };
     const amountChanged = !!old && money(toAmount(old.amount)) !== money(toAmount(a.amount));
     return amountChanged ? settleIfCovered(entry) : entry;
