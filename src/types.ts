@@ -144,6 +144,8 @@ export type AutoRide = HasId & {
   driverPay?: string;
   status?: AutoRideStatus;
   paymentStatus?: AutoRidePaymentStatus;
+  reason?: string;
+  dieselId?: string;
   notes?: string;
   createdAt?: string;
 };
@@ -156,6 +158,8 @@ export type AutoDieselEntry = HasId & {
   filledByDriver?: string;
   stationOrVehicle?: string;
   repairItem?: string;
+  reason?: string;
+  rideIds?: string[];
   notes?: string;
   createdAt?: string;
 };

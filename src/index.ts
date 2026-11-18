@@ -1119,6 +1119,8 @@ app.delete("/api/staff/:staffId/settlements/:settlementNumber", async (c) => {
       driverPay: auth.role === "owner" ? String(parseFloat(String(body.driverPay || "0")) || 0) : "0",
       status: body.status || "completed",
       paymentStatus: auth.role === "owner" ? (body.paymentStatus || (due === 0 && total > 0 ? "paid" : "due")) : "due",
+      reason: (body.reason || "").toString().trim(),
+      dieselId: (body.dieselId || "").toString().trim(),
       notes: (body.notes || "").toString().trim(),
       createdAt: new Date().toISOString(),
     };
@@ -1157,6 +1159,8 @@ app.delete("/api/staff/:staffId/settlements/:settlementNumber", async (c) => {
     if (body.driverPay !== undefined) patch.driverPay = String(body.driverPay).trim();
     if (body.status !== undefined) patch.status = body.status;
     if (body.paymentStatus !== undefined) patch.paymentStatus = body.paymentStatus;
+    if (typeof body.reason === "string") patch.reason = body.reason.trim();
+    if (typeof body.dieselId === "string") patch.dieselId = body.dieselId.trim();
     if (typeof body.notes === "string") patch.notes = body.notes.trim();
 
     const updated = await db.updateAutoRide(c.env.DB, id, patch);
@@ -1205,7 +1209,9 @@ app.delete("/api/staff/:staffId/settlements/:settlementNumber", async (c) => {
       litres: (body.litres || "").toString().trim(),
       filledByDriver: (body.filledByDriver || "").toString().trim(),
       stationOrVehicle: (body.stationOrVehicle || "").toString().trim(),
-      repairItem: (body.repairItem || "").toString().trim(),
+      repairItem: (body.repairItem || body.reason || "").toString().trim(),
+      reason: (body.reason || body.repairItem || "").toString().trim(),
+      rideIds: Array.isArray(body.rideIds) ? body.rideIds : [],
       notes: (body.notes || "").toString().trim(),
       createdAt: new Date().toISOString(),
     };
